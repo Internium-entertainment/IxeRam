@@ -1,0 +1,12 @@
+build/
+.cache/
+.vscode/
+compile_commands.json
+*.o
+*.a
+*.so
+*.pyc
+__pycache__/
+*.exe
+.DS_Store
+memdebug
