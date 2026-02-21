@@ -1,5 +1,7 @@
 # IxeRam
 
+![IxeRam TUI](image.png)
+
 **IxeRam** is an advanced terminal-based (TUI) memory scanner, debugger, and manipulator for Linux. 
 
 Made by **Internium Entertainment**
