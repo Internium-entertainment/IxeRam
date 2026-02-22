@@ -2,9 +2,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 Scanner::Scanner(MemoryEngine &engine)
@@ -212,46 +215,104 @@ bool Scanner::write_value(uintptr_t address, const std::string &value_str) {
 
 // ─── Initial scan ────────────────────────────────────────────────────────────
 template <typename T> void Scanner::initial_scan_typed(T target) {
+  scanning_active = true;
+  progress = 0;
   results.clear();
+
   auto regions = engine.update_maps();
-  const size_t CHUNK = 65536;
-  std::vector<uint8_t> buffer(CHUNK);
+  std::vector<MemoryRegion> filtered_regions;
+  uint64_t total_size = 0;
 
   for (const auto &region : regions) {
     if (!region.is_readable() || !region.is_writable())
       continue;
     if (region.pathname == "[vsyscall]")
       continue;
-    // Skip very large regions to be somewhat fast
-    if ((region.end - region.start) > 512 * 1024 * 1024ULL)
+    if ((region.end - region.start) >
+        1024 * 1024 * 1024ULL) // 1GB cap per region
       continue;
+    filtered_regions.push_back(region);
+    total_size += (region.end - region.start);
+  }
 
-    for (uintptr_t addr = region.start; addr < region.end; addr += CHUNK) {
-      size_t to_read = std::min(CHUNK, (size_t)(region.end - addr));
-      if (to_read < sizeof(T))
-        continue;
-      if (!engine.read_memory(addr, buffer.data(), to_read))
-        continue;
+  if (filtered_regions.empty()) {
+    scanning_active = false;
+    return;
+  }
 
-      for (size_t i = 0; i + sizeof(T) <= to_read; ++i) {
-        T val;
-        std::memcpy(&val, &buffer[i], sizeof(T));
-        bool match = false;
-        if constexpr (std::is_floating_point_v<T>) {
-          match = (std::fabs((double)(val - target)) < 0.001);
-        } else {
-          match = (val == target);
-        }
-        if (match) {
-          ScanResult sr;
-          sr.address = addr + i;
-          sr.prev_value.resize(sizeof(T));
-          std::memcpy(sr.prev_value.data(), &val, sizeof(T));
-          results.push_back(std::move(sr));
+  std::mutex results_mutex;
+  unsigned int num_threads = std::thread::hardware_concurrency();
+  if (num_threads == 0)
+    num_threads = 4;
+
+  std::vector<std::future<void>> futures;
+  std::atomic<uint64_t> bytes_processed{0};
+
+  // Group work into sensible chunks for the thread pool
+  for (unsigned int t = 0; t < num_threads; ++t) {
+    futures.push_back(std::async(std::launch::async, [&, t, num_threads]() {
+      const size_t CHUNK_SIZE = 1024 * 1024;
+      std::vector<uint8_t> buffer(CHUNK_SIZE);
+      std::vector<ScanResult> local_results;
+
+      for (size_t r_idx = t; r_idx < filtered_regions.size();
+           r_idx += num_threads) {
+        const auto &region = filtered_regions[r_idx];
+
+        for (uintptr_t addr = region.start; addr < region.end;
+             addr += CHUNK_SIZE) {
+          size_t to_read = std::min(CHUNK_SIZE, (size_t)(region.end - addr));
+          if (to_read < sizeof(T)) {
+            bytes_processed += to_read;
+            continue;
+          }
+
+          if (engine.read_memory(addr, buffer.data(), to_read)) {
+            size_t step = aligned_scan ? std::max((size_t)1, sizeof(T)) : 1;
+            for (size_t i = 0; i + sizeof(T) <= to_read; i += step) {
+              T val;
+              std::memcpy(&val, &buffer[i], sizeof(T));
+
+              bool match = false;
+              if constexpr (std::is_floating_point_v<T>) {
+                match = (std::fabs((double)(val - target)) < 0.001);
+              } else {
+                match = (val == target);
+              }
+
+              if (match) {
+                ScanResult sr;
+                sr.address = addr + i;
+                std::memset(sr.prev_value, 0, 8);
+                std::memcpy(sr.prev_value, &val, sizeof(T));
+                local_results.push_back(sr);
+              }
+            }
+          }
+          bytes_processed += to_read;
+          progress = (float)bytes_processed.load() / total_size;
         }
       }
-    }
+
+      if (!local_results.empty()) {
+        std::lock_guard<std::mutex> lock(results_mutex);
+        results.insert(results.end(), local_results.begin(),
+                       local_results.end());
+      }
+    }));
   }
+
+  for (auto &f : futures)
+    f.wait();
+
+  // Sort results by address for consistency
+  std::sort(results.begin(), results.end(),
+            [](const ScanResult &a, const ScanResult &b) {
+              return a.address < b.address;
+            });
+
+  progress = 1.0f;
+  scanning_active = false;
 }
 
 void Scanner::initial_scan(ValueType type, const std::string &value_str) {
@@ -349,81 +410,134 @@ void Scanner::initial_scan(ValueType type, const std::string &value_str) {
 // ─── Next scan ───────────────────────────────────────────────────────────────
 template <typename T>
 void Scanner::next_scan_typed(ScanType scan_type, T target, bool use_target) {
+  if (results.empty())
+    return;
+
+  scanning_active = true;
+  progress = 0;
+
   std::vector<ScanResult> next_results;
-  next_results.reserve(results.size());
+  std::mutex results_mutex;
 
-  for (auto &sr : results) {
-    T current_val;
-    if (!engine.read_memory(sr.address, &current_val, sizeof(T)))
-      continue;
+  unsigned int num_threads = std::thread::hardware_concurrency();
+  if (num_threads == 0)
+    num_threads = 2;
+  if (num_threads > results.size())
+    num_threads = results.size();
 
-    T prev_val;
-    if (sr.prev_value.size() == sizeof(T))
-      std::memcpy(&prev_val, sr.prev_value.data(), sizeof(T));
-    else
-      prev_val = current_val; // fallback
+  size_t chunk_size = results.size() / num_threads;
+  std::vector<std::future<void>> futures;
+  std::atomic<size_t> items_processed{0};
 
-    bool match = false;
-    switch (scan_type) {
-    case ScanType::ExactValue:
-      if constexpr (std::is_floating_point_v<T>)
-        match = std::fabs((double)(current_val - target)) < 0.001;
-      else
-        match = (current_val == target);
-      break;
-    case ScanType::NotEqual:
-      if constexpr (std::is_floating_point_v<T>)
-        match = std::fabs((double)(current_val - target)) >= 0.001;
-      else
-        match = (current_val != target);
-      break;
-    case ScanType::BiggerThan:
-      match = (current_val > target);
-      break;
-    case ScanType::SmallerThan:
-      match = (current_val < target);
-      break;
-    case ScanType::Increased:
-      match = (current_val > prev_val);
-      break;
-    case ScanType::IncreasedBy:
-      if constexpr (std::is_floating_point_v<T>)
-        match = std::fabs((double)((current_val - prev_val) - target)) < 0.001;
-      else
-        match = ((current_val - prev_val) == target);
-      break;
-    case ScanType::Decreased:
-      match = (current_val < prev_val);
-      break;
-    case ScanType::DecreasedBy:
-      if constexpr (std::is_floating_point_v<T>)
-        match = std::fabs((double)((prev_val - current_val) - target)) < 0.001;
-      else
-        match = ((prev_val - current_val) == target);
-      break;
-    case ScanType::Changed:
-      if constexpr (std::is_floating_point_v<T>)
-        match = std::fabs((double)(current_val - prev_val)) >= 0.0001;
-      else
-        match = (current_val != prev_val);
-      break;
-    case ScanType::Unchanged:
-      if constexpr (std::is_floating_point_v<T>)
-        match = std::fabs((double)(current_val - prev_val)) < 0.0001;
-      else
-        match = (current_val == prev_val);
-      break;
-    }
+  for (unsigned int t = 0; t < num_threads; ++t) {
+    size_t t_start = t * chunk_size;
+    size_t t_end =
+        (t == num_threads - 1) ? results.size() : (t + 1) * chunk_size;
 
-    if (match) {
-      ScanResult updated;
-      updated.address = sr.address;
-      updated.prev_value.resize(sizeof(T));
-      std::memcpy(updated.prev_value.data(), &current_val, sizeof(T));
-      next_results.push_back(std::move(updated));
-    }
+    futures.push_back(std::async(std::launch::async, [&, t_start, t_end]() {
+      std::vector<ScanResult> local_results;
+      const size_t BATCH = 1000;
+      std::vector<uintptr_t> addrs(BATCH);
+      std::vector<T> values(BATCH);
+
+      for (size_t i = t_start; i < t_end; i += BATCH) {
+        size_t current_batch = std::min(BATCH, t_end - i);
+        addrs.resize(current_batch);
+        values.resize(current_batch);
+
+        for (size_t j = 0; j < current_batch; ++j) {
+          addrs[j] = results[i + j].address;
+        }
+
+        engine.read_memory_batch(addrs, values.data(), sizeof(T));
+
+        for (size_t j = 0; j < current_batch; ++j) {
+          const auto &sr = results[i + j];
+          T current_val = values[j];
+          T prev_val;
+          std::memcpy(&prev_val, sr.prev_value, sizeof(T));
+
+          bool match = false;
+          switch (scan_type) {
+          case ScanType::ExactValue:
+            if constexpr (std::is_floating_point_v<T>)
+              match = std::fabs((double)(current_val - target)) < 0.001;
+            else
+              match = (current_val == target);
+            break;
+          case ScanType::NotEqual:
+            if constexpr (std::is_floating_point_v<T>)
+              match = std::fabs((double)(current_val - target)) >= 0.001;
+            else
+              match = (current_val != target);
+            break;
+          case ScanType::BiggerThan:
+            match = (current_val > target);
+            break;
+          case ScanType::SmallerThan:
+            match = (current_val < target);
+            break;
+          case ScanType::Increased:
+            match = (current_val > prev_val);
+            break;
+          case ScanType::IncreasedBy:
+            if constexpr (std::is_floating_point_v<T>)
+              match = std::fabs((double)((current_val - prev_val) - target)) <
+                      0.001;
+            else
+              match = ((current_val - prev_val) == target);
+            break;
+          case ScanType::Decreased:
+            match = (current_val < prev_val);
+            break;
+          case ScanType::DecreasedBy:
+            if constexpr (std::is_floating_point_v<T>)
+              match = std::fabs((double)((prev_val - current_val) - target)) <
+                      0.001;
+            else
+              match = ((prev_val - current_val) == target);
+            break;
+          case ScanType::Changed:
+            if constexpr (std::is_floating_point_v<T>)
+              match = std::fabs((double)(current_val - prev_val)) >= 0.0001;
+            else
+              match = (current_val != prev_val);
+            break;
+          case ScanType::Unchanged:
+            if constexpr (std::is_floating_point_v<T>)
+              match = std::fabs((double)(current_val - prev_val)) < 0.0001;
+            else
+              match = (current_val == prev_val);
+            break;
+          }
+
+          if (match) {
+            ScanResult updated;
+            updated.address = sr.address;
+            std::memset(updated.prev_value, 0, 8);
+            std::memcpy(updated.prev_value, &current_val, sizeof(T));
+            local_results.push_back(updated);
+          }
+          items_processed++;
+        }
+        progress = (float)items_processed.load() / results.size();
+      }
+
+      if (!local_results.empty()) {
+        std::lock_guard<std::mutex> lock(results_mutex);
+        next_results.insert(next_results.end(),
+                            std::make_move_iterator(local_results.begin()),
+                            std::make_move_iterator(local_results.end()));
+      }
+    }));
   }
+
+  for (auto &f : futures)
+    f.wait();
+
   results = std::move(next_results);
+  progress = 1.0f;
+  scanning_active = false;
 }
 
 void Scanner::next_scan(ScanType scan_type, const std::string &value_str) {
@@ -515,7 +629,10 @@ void Scanner::next_scan(ScanType scan_type, const std::string &value_str) {
 
 // ─── AOB Scan ────────────────────────────────────────────────────────────────
 void Scanner::aob_scan(const std::string &pattern) {
+  scanning_active = true;
+  progress = 0;
   results.clear();
+
   std::vector<int> pattern_bytes;
   std::istringstream iss(pattern);
   std::string tok;
@@ -525,45 +642,118 @@ void Scanner::aob_scan(const std::string &pattern) {
     else
       pattern_bytes.push_back(std::stoi(tok, nullptr, 16));
   }
-  if (pattern_bytes.empty())
+  if (pattern_bytes.empty()) {
+    scanning_active = false;
     return;
+  }
 
   auto regions = engine.update_maps();
-  const size_t CHUNK = 65536;
-  std::vector<uint8_t> buffer(CHUNK);
+  std::vector<MemoryRegion> filtered_regions;
+  uint64_t total_size = 0;
 
   for (const auto &region : regions) {
     if (!region.is_readable() || region.pathname == "[vsyscall]")
       continue;
-    if ((region.end - region.start) > 512 * 1024 * 1024ULL)
+    if ((region.end - region.start) > 1024 * 1024 * 1024ULL)
       continue;
+    filtered_regions.push_back(region);
+    total_size += (region.end - region.start);
+  }
 
-    for (uintptr_t addr = region.start; addr < region.end; addr += CHUNK) {
-      size_t to_read = std::min(CHUNK, (size_t)(region.end - addr));
-      if (to_read < pattern_bytes.size())
-        continue;
-      if (!engine.read_memory(addr, buffer.data(), to_read))
-        continue;
+  if (filtered_regions.empty()) {
+    scanning_active = false;
+    return;
+  }
 
-      for (size_t i = 0; i + pattern_bytes.size() <= to_read; ++i) {
-        bool m = true;
-        for (size_t j = 0; j < pattern_bytes.size(); ++j) {
-          if (pattern_bytes[j] != -1 &&
-              buffer[i + j] != (uint8_t)pattern_bytes[j]) {
-            m = false;
-            break;
+  std::mutex results_mutex;
+  unsigned int num_threads = std::thread::hardware_concurrency();
+  if (num_threads == 0)
+    num_threads = 4;
+
+  std::vector<std::future<void>> futures;
+  std::atomic<uint64_t> bytes_processed{0};
+
+  for (unsigned int t = 0; t < num_threads; ++t) {
+    futures.push_back(std::async(std::launch::async, [&, t, num_threads,
+                                                      pattern_bytes]() {
+      const size_t CHUNK_SIZE = 1024 * 1024;
+      std::vector<uint8_t> buffer(CHUNK_SIZE);
+      std::vector<ScanResult> local_results;
+
+      for (size_t r_idx = t; r_idx < filtered_regions.size();
+           r_idx += num_threads) {
+        const auto &region = filtered_regions[r_idx];
+
+        for (uintptr_t addr = region.start; addr < region.end;
+             addr += CHUNK_SIZE) {
+          size_t to_read = std::min(CHUNK_SIZE, (size_t)(region.end - addr));
+          if (to_read < pattern_bytes.size()) {
+            bytes_processed += to_read;
+            continue;
           }
-        }
-        if (m) {
-          ScanResult sr;
-          sr.address = addr + i;
-          sr.prev_value.assign(buffer.begin() + i,
-                               buffer.begin() + i + pattern_bytes.size());
-          results.push_back(std::move(sr));
+
+          if (engine.read_memory(addr, buffer.data(), to_read)) {
+            uint8_t first_byte =
+                (pattern_bytes[0] == -1) ? 0 : (uint8_t)pattern_bytes[0];
+            bool first_wild = (pattern_bytes[0] == -1);
+
+            for (size_t i = 0; i + pattern_bytes.size() <= to_read; ++i) {
+              if (!first_wild) {
+                uint8_t *p = (uint8_t *)std::memchr(
+                    &buffer[i], first_byte,
+                    to_read - i - pattern_bytes.size() + 1);
+                if (!p)
+                  break;
+                i = p - &buffer[0];
+              }
+
+              bool match = true;
+              // If first_wild is false, the first byte is already matched by
+              // memchr. If first_wild is true, pattern_bytes[0] is -1, so it
+              // always matches. In both cases, we start checking from the
+              // second byte (index 1).
+              for (size_t j = 1; j < pattern_bytes.size();
+                   ++j) { // Start from 1
+                if (pattern_bytes[j] != -1 &&
+                    buffer[i + j] != (uint8_t)pattern_bytes[j]) {
+                  match = false;
+                  break;
+                }
+              }
+
+              if (match) {
+                ScanResult sr;
+                sr.address = addr + i;
+                std::memset(sr.prev_value, 0, 8);
+                size_t copy_sz = std::min((size_t)8, pattern_bytes.size());
+                std::memcpy(sr.prev_value, &buffer[i], copy_sz);
+                local_results.push_back(sr);
+              }
+            }
+          }
+          bytes_processed += to_read;
+          progress = (float)bytes_processed.load() / total_size;
         }
       }
-    }
+
+      if (!local_results.empty()) {
+        std::lock_guard<std::mutex> lock(results_mutex);
+        results.insert(results.end(), local_results.begin(),
+                       local_results.end());
+      }
+    }));
   }
+
+  for (auto &f : futures)
+    f.wait();
+
+  std::sort(results.begin(), results.end(),
+            [](const ScanResult &a, const ScanResult &b) {
+              return a.address < b.address;
+            });
+
+  progress = 1.0f;
+  scanning_active = false;
 }
 
 bool Scanner::match_pattern(const std::vector<uint8_t> &data,

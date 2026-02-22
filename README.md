@@ -1,72 +1,97 @@
-# IxeRam
+# ⬡ IxeRam
 
 ![IxeRam TUI](image.png)
 
-**IxeRam** is an advanced terminal-based (TUI) memory scanner, debugger, and manipulator for Linux. 
+**IxeRam** is a high-performance, terminal-native memory scanner and debugger for Linux. It provides a "Cheat Engine-like" experience for developers and reverse engineers who prefer the terminal or work over SSH.
 
-Made by **Internium Entertainment**
-Thanks to developers: myster_gif
+## 🚀 Why IxeRam?
 
-## Features
+Unlike traditional GUI-based tools, IxeRam is designed for speed, low overhead, and massive scale.
 
-- **Process Memory Scanning**: Scan for integer, float, strings, and byte arrays in memory.
-- **Dynamic Pointer Scanning**: Discover and track static pointer paths that survive process restarts.
-- **Interactive Disassembler**: Real-time view of x86-64 assembly instructions.
-- **Auto-Assembler Patching**: Use inline assembly to patch instructions on the fly (powered by Keystone Engine).
-- **Structure Dissector**: Analyze custom memory structures and visualize offsets as hex, variables, float and strings all at once.
-- **Speedhack Configuration**: Alter the target process speed (requires `libspeedhack.so` via `LD_PRELOAD`).
-- **Memory Map & Call Graph**: Analyze the internal structure, heap, modules, and call traces in real-time.
+*   **Multi-Threaded Engine:** Parallelized memory scanning that utilizes all available CPU cores for lightning-fast results.
+*   **Asynchronous UI:** A non-blocking terminal interface that stays responsive even during multi-gigabyte scans.
+*   **Zero Dependencies (Self-Contained):** Static builds for FTXUI, Capstone, and Keystone. No manual library management.
+*   **Ghidra Workflow Integration:** Sync ImageBase with Ghidra and export Python scripts to label your discovered addresses automatically.
+*   **Kernel-Level Speed:** Uses `process_vm_readv` and `process_vm_writev` for high-speed direct memory access.
 
-## Dependencies
+## 🛠️ Key Features
 
-You need to have the following libraries installed:
-- C++17 Compiler (g++, clang++)
-- CMake
-- Capstone Engine (for disassembly)
-- Keystone Engine (for assembly patching)
-- FTXUI (fetches automatically or via pkg-config)
+- 🔍 **Advanced Memory Scanner**: 
+    - Support for Int8/16/32/64, Float, Double, Strings, and AOB (Array of Bytes) with wildcards.
+    - **Multi-threaded** search and refinement.
+    - Real-time value tracking with color-coded changes (Red = Up, Blue = Down).
+- 🧩 **Static Pointer Discovery**: Find pointer paths that persist across process restarts (multi-level pointer scanning).
+- ⚡ **Interactive Dizassembelr**: Real-time x86-64 disassembly with syntax highlighting and jump-to-address support.
+- 🛠️ **Live Patching**: Write assembly instructions directly into memory using the integrated **Keystone Engine**.
+- 📐 **Structure Dissector**: Visualize memory regions as complex structures with real-time value updates.
+- ⛓️ **Call Graph Analysis**: Heuristic-based call graph construction for analyzing function flows and identifying logic.
+- ❄️ **Memory Freezing**: Lock values in memory to prevent the process from changing them.
+- 📤 **Data Export**: Export results to JSON or Ghidra Python scripts for automation.
+- 🕒 **Integrated Speedhack**: Control the flow of time via `LD_PRELOAD` shared memory config.
 
-## Build
+## 🏁 Getting Started
 
-Compile using CMake:
+### Prerequisites
+- C++17 compatible compiler (`g++` or `clang++`)
+- `cmake` (version 3.14+)
+- `git`
 
-```sh
+### Build and Install
+IxeRam uses a "batteries included" build system. It will automatically fetch and statically link all dependencies.
+
+```bash
+# Clone and enter the directory
+git clone https://github.com/Internium-Entertainment/IxeRam.git
+cd IxeRam
+
+# Build the project
 cmake -B build -S .
 cmake --build build -j$(nproc)
 ```
 
-## Usage
+### Usage
+Run with root privileges (required for `process_vm_readv`):
 
-Run the compiled executable to start the TUI:
-
-```sh
+```bash
 sudo ./build/memdebug
 ```
-*Note: Depending on your system security configurations (`ptrace_scope`), root privileges might be required to attach to arbitrary process IDs.*
 
-### Speedhack 
-To use the speedhack features, launch your target game/process with the compiled shared library:
-```sh
-LD_PRELOAD=./build/libspeedhack.so ./your_target_executable
-```
-Then attach **IxeRam** to the process and press `F10` to configure the speed multiplier. 
+#### Using the Speedhack
+1. Launch your target app with the library: `LD_PRELOAD=./build/libspeedhack.so ./your_target_app`
+2. In IxeRam, press **F10** to set the time multiplier.
 
-## Keybindings (TUI)
+## ⌨️ Default Keybindings
 
-- **F4**: Attach to PID.
-- **F2**: Initial Scan.
-- **F7**: Next Scan.
-- **F8**: Clear Scan Results.
-- **F10**: Speedhack Modal.
-- **Space**: Patch Memory (Assembly/Hex) when in Disasm tab.
-- **Tab**: Switch Navigation Tabs (Addresses / Map / Call Graph / Watch / Pointers / Disasm / Struct).
-- **Q**: Quit.
+| Key | Action |
+|-----|--------|
+| **Tab** | Cycle through views (Addresses, Map, Call Graph, Watch, Pointers, Disasm, Struct) |
+| **F2** | Open Initial Scan Modal |
+| **F7** | Open Next Scan (Filter) Modal |
+| **F8** | Clear all scan results |
+| **F4** | Attach to a Process (PID) |
+| **W** | Write New Value to selected address |
+| **G** | Go to specific Memory Address |
+| **A** | Add selected address to Watchlist |
+| **P** | Run Pointer Scanner on selected address |
+| **B** | Build Call Graph from selected instruction |
+| **X** | Export Results to JSON |
+| **E** | Export Results to Ghidra Script |
+| **Space** | (In Disasm) Patch with Assembly or Hex bytes |
+| **F5** | Freeze/Unfreeze value at current address |
+| **F10**| Set Speedhack Multiplier |
+| **F11**| Pause/Resume Target Process |
+| **F12**| Kill Target Process |
+| **Q** | Clean Quit (Detaches safely) |
 
-## License
+## 📐 Architecture
+- **Scanner.cpp**: Multi-threaded scanning logic using `std::future` and `std::async`.
+- **MemoryEngine.cpp**: Linux syscall wrappers and process management.
+- **TUI_run.cpp**: Main UI loop using FTXUI with virtual list optimizations for handling 1M+ results.
+- **speedhack.c**: Shared library for `LD_PRELOAD` time manipulation.
 
-This project is dual-licensed and managed by Internium-entertainment:
+## 📜 License
+IxeRam is dual-licensed:
+1. **GNU AGPLv3** for open-source and non-commercial use.
+2. **InterXlicense v1.0** for commercial deployments.
 
-- **Option 1: GNU AGPLv3** (Open Source) – Free for non-commercial networking and local use as long as the project retains the AGPLv3 license.
-- **Option 2: InterXlicense v1.0** (Commercial) – Allows modifications and non-commercial usage. Commercial use is permitted ONLY with **explicit written consent** and coordination. The author retains the absolute right to revoke this license at any time.
-
-See the [LICENSE](LICENSE) file for full details.
+Made with 💜 by **myster_gif** @ **Internium Entertainment**.

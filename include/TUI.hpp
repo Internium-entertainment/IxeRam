@@ -169,6 +169,7 @@ private:
   bool show_watch_modal = false;
   bool show_struct_modal = false;
   bool show_speedhack_modal = false;
+  bool show_kill_modal = false;
 
   std::string ghidra_base_input;
   std::string watch_desc_input;

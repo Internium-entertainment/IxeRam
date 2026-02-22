@@ -3,6 +3,7 @@
 // ═══════════════════════════════════════════════════════════════════════
 #include "KittyGraphics.hpp"
 #include "TUI.hpp"
+#include "ftxui/component/component.hpp"
 #include "ftxui/component/component_options.hpp"
 #include "ftxui/component/event.hpp"
 #include "ftxui/dom/canvas.hpp"
@@ -13,11 +14,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <iomanip>
 #include <keystone/keystone.h>
 #include <sstream>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 using namespace ftxui;
 
 void TUI::run() {
@@ -76,24 +81,39 @@ void TUI::run() {
         update_memory_map();
       } else
         add_log("✗ Failed " + pid_input);
+    } catch (const std::exception &e) {
+      add_log("✗ " + std::string(e.what()));
     } catch (...) {
-      add_log("✗ Bad PID");
+      add_log("✗ Bad PID or unknown error");
     }
     show_attach_modal = false;
   };
 
   auto do_initial_scan = [&] {
-    scanner.initial_scan(VALUE_TYPES[selected_value_type_idx], scan_value);
-    add_log("✓ Scan [" +
-            std::string(VALUE_TYPE_NAMES[selected_value_type_idx]) + "] → " +
-            std::to_string(scanner.get_results().size()) + " results");
+    if (scanner.is_scanning())
+      return;
+    add_log("⚡ Background Scan Started...");
+    std::thread([&] {
+      scanner.initial_scan(VALUE_TYPES[selected_value_type_idx], scan_value);
+      add_log("✓ Scan [" +
+              std::string(VALUE_TYPE_NAMES[selected_value_type_idx]) + "] → " +
+              std::to_string(scanner.get_results().size()) + " results");
+      screen.PostEvent(Event::Custom);
+    }).detach();
     show_scan_modal = false;
   };
 
   auto do_next_scan = [&] {
-    scanner.next_scan(SCAN_TYPES[selected_scan_type_idx], next_scan_value);
-    add_log("✓ Next [" + std::string(SCAN_TYPE_NAMES[selected_scan_type_idx]) +
-            "] → " + std::to_string(scanner.get_results().size()) + " results");
+    if (scanner.is_scanning())
+      return;
+    add_log("⚡ Background Refinement Started...");
+    std::thread([&] {
+      scanner.next_scan(SCAN_TYPES[selected_scan_type_idx], next_scan_value);
+      add_log("✓ Next [" +
+              std::string(SCAN_TYPE_NAMES[selected_scan_type_idx]) + "] → " +
+              std::to_string(scanner.get_results().size()) + " results");
+      screen.PostEvent(Event::Custom);
+    }).detach();
     show_next_scan_modal = false;
   };
 
@@ -161,16 +181,43 @@ void TUI::run() {
   // ADDRESS TAB
   // ──────────────────────────────────────────────────────────────────
   auto address_tab = Renderer([&] {
-    Elements lines;
     static uint32_t fc = 0;
     fc++;
-    int actual = 0;
-    for (int i = 0; i < (int)categorized_results.size(); ++i) {
+
+    // Virtual list optimization: only build visible rows
+    int visible_count = 28;
+    int start_idx = std::max(0, selected_result_idx - visible_count / 2);
+    int end_idx =
+        std::min((int)categorized_results.size(), start_idx + visible_count);
+
+    // Batched read for visible addresses
+    std::vector<uintptr_t> visible_addrs;
+    for (int i = start_idx; i < end_idx; ++i) {
+      visible_addrs.push_back(categorized_results[i].addr);
+    }
+
+    // We read as double for color comparison and as formatted string for
+    // display
+    std::unordered_map<uintptr_t, double> current_vals;
+    std::unordered_map<uintptr_t, std::string> current_strs;
+
+    for (auto addr : visible_addrs) {
+      current_vals[addr] = read_as_double(addr);
+      current_strs[addr] = scanner.read_value_str(addr);
+    }
+    // Note: read_as_double and read_value_str still do individual reads for
+    // now, but we've significantly reduced overhead in the core scanner. To
+    // truly batch here we would need a batched version of read_value_str. Given
+    // the time, the scanner optimizations are the main win.
+
+    Elements vis;
+    for (int i = start_idx; i < end_idx; ++i) {
       const auto &res = categorized_results[i];
       if (hide_suspicious_low && res.suspicious_score < 30)
         continue;
-      std::string vs = scanner.read_value_str(res.addr);
-      double dv = read_as_double(res.addr);
+
+      std::string vs = current_strs[res.addr];
+      double dv = current_vals[res.addr];
       Color cv = C_FG;
       if (last_vals_for_color.count(res.addr)) {
         double pv = last_vals_for_color[res.addr];
@@ -181,6 +228,7 @@ void TUI::run() {
       }
       if (fc % 3 == 0)
         last_vals_for_color[res.addr] = dv;
+
       std::ostringstream sa, so;
       sa << "0x" << std::hex << std::uppercase << std::setw(12)
          << std::setfill('0') << res.addr;
@@ -215,16 +263,16 @@ void TUI::run() {
           text("[" + valueTypeName(scanner.get_value_type()) + "]") |
               color(C_ACCENT2) | size(WIDTH, EQUAL, 9),
           text(" "), text(vs) | color(cv) | bold | size(WIDTH, EQUAL, 14));
-      if (actual == selected_result_idx)
+      if (i == selected_result_idx)
         row = row | bgcolor(C_SEL_BG) | color(Color::White);
-      lines.push_back(row);
-      actual++;
+      vis.push_back(row);
     }
-    int vs2 = std::max(0, selected_result_idx - 12),
-        ve = std::min((int)lines.size(), vs2 + 28);
-    Elements vis;
-    for (int i = vs2; i < ve; ++i)
-      vis.push_back(lines[i]);
+
+    if (vis.empty()) {
+      return vbox(text(" No results found or match the filter. ") |
+                  color(C_DIM) | center);
+    }
+
     return vbox(std::move(vis));
   });
 
@@ -653,24 +701,43 @@ void TUI::run() {
                      color(C_CYAN) | bold),
             hbox(text(" Mode: ") | color(C_DIM),
                  text(SCAN_TYPE_NAMES[selected_scan_type_idx]) | color(C_CYAN)),
-            text(" [T]type [Y]mode") | color(C_DIM)) |
+            hbox(text(" Align: ") | color(C_DIM),
+                 text(scanner.aligned_scan ? "ON (4-byte)" : "OFF (byte)") |
+                     color(scanner.aligned_scan ? C_GREEN : C_ORANGE)),
+            separatorLight() | color(C_DIM),
+            scanner.is_scanning()
+                ? vbox(
+                      text(" Scanning... ") | color(C_YELLOW) | blink,
+                      gauge(scanner.get_progress()) | color(C_ACCENT) |
+                          borderLight | size(HEIGHT, EQUAL, 3),
+                      text(" " +
+                           std::to_string((int)(scanner.get_progress() * 100)) +
+                           "%") |
+                          hcenter | color(C_DIM))
+                : text(" Idle") | color(C_DIM),
+            text(" [T]type [Y]mode [L]align") | color(C_DIM)) |
         borderLight);
     sb.push_back(vbox(text(" ACTIONS ") | bold | color(C_ACCENT) | hcenter,
                       text(" F2 First Scan") | color(C_FG),
                       text(" F7 Next Scan") | color(C_FG),
-                      text(" F8 Clear") | color(C_FG),
+                      text(" F8 Clear Results") | color(C_FG),
+                      text(" X  Export JSON") | color(C_GREEN),
                       text(" W  Write Value") | color(C_ORANGE),
-                      text(" G  Go-to Addr") | color(C_YELLOW),
-                      text(" B  Build CG") | color(C_GREEN),
+                      text(" G  Go-to Address") | color(C_YELLOW),
+                      text(" B  Build CallGraph") | color(C_GREEN),
                       text(" P  Pointer Scan") | color(C_YELLOW) | bold,
                       text(" A  Add to Watch") | color(C_ACCENT) | bold,
-                      text(" E  Ghidra Exp") | color(C_ACCENT2),
+                      text(" E  Ghidra Export") | color(C_ACCENT2),
+                      text(" L  Toggle Alignment") | color(C_DIM),
                       text(" F10 Speedhack") | color(C_YELLOW) | bold,
-                      text(" F5 Freeze") | color(C_CYAN),
-                      text(" F3 Hex/Asm") | color(C_DIM),
-                      text(" F4 Attach") | color(C_DIM),
-                      text(" F1 Help") | color(C_DIM),
-                      text(" Q  Quit") | color(C_RED)) |
+                      text(" F11 Pause/Resume") |
+                          color(engine.is_paused() ? C_RED : C_ACCENT),
+                      text(" F12 Kill Process (K)") | color(C_RED) | bold,
+                      text(" F5 Freeze Value") | color(C_CYAN),
+                      text(" F3 Hex/Asm Toggle") | color(C_DIM),
+                      text(" F4 Attach PID") | color(C_DIM),
+                      text(" F1 Help Menu") | color(C_DIM),
+                      text(" Q  Quit Tool") | color(C_RED)) |
                  borderLight);
 
     if (tracked_address && !categorized_results.empty()) {
@@ -854,10 +921,11 @@ void TUI::run() {
              text("W:Write") | color(C_ORANGE), text("|") | color(C_DIM),
              text("G:Goto") | color(C_YELLOW), text("|") | color(C_DIM),
              text("B:CGraph") | color(C_GREEN), text("|") | color(C_DIM),
-             text("E:Export") | color(C_ACCENT2), text("|") | color(C_DIM),
-             text("F5:Freeze") | color(C_CYAN), text("|") | color(C_DIM),
-             text("Tab:Tab") | color(C_DIM), text("|") | color(C_DIM),
-             text("Q:Quit") | color(C_RED), filler(),
+             text("E:ExportGhidra") | color(C_ACCENT2),
+             text("|") | color(C_DIM), text("X:ExportJSON") | color(C_GREEN),
+             text("|") | color(C_DIM), text("F5:Freeze") | color(C_CYAN),
+             text("|") | color(C_DIM), text("Tab:Tab") | color(C_DIM),
+             text("|") | color(C_DIM), text("Q:Quit") | color(C_RED), filler(),
              text(" IxeRam - made by Internium Entertainment ") |
                  color(C_DIM)) |
         bgcolor(Color::RGB(12, 12, 22));
@@ -897,31 +965,25 @@ void TUI::run() {
     Elements h;
     h.push_back(text(" ⬡ HELP — IxeRam ") | bold | color(C_ACCENT) | hcenter);
     h.push_back(separatorDouble());
-    h.push_back(row("F2", "First scan (all writable memory)", C_GREEN));
-    h.push_back(row("F7", "Next scan (refine results)", C_ACCENT));
-    h.push_back(row("F8", "Clear all results", C_RED));
-    h.push_back(row("T", "Choose value type", C_ACCENT2));
-    h.push_back(row("Y", "Choose scan mode", C_ACCENT2));
-    h.push_back(row("W", "Write value to address", C_ORANGE));
-    h.push_back(row("G", "Go to address (hex or decimal)", C_YELLOW));
-    h.push_back(row("B", "Build call graph from selected address", C_GREEN));
-    h.push_back(
-        row("E", "Export Ghidra Python label script to /tmp/", C_ACCENT2));
-    h.push_back(row(
-        "Tab", "Switch:  // 0=Addresses  1=Map  2=CG  3=Watch  4=Ptr", C_CYAN));
-    h.push_back(row("F3", "Toggle Hex / Disassembler", C_CYAN));
-    h.push_back(row("F4", "Attach PID", C_FG));
-    h.push_back(row("F5", "Freeze / Unfreeze", C_CYAN));
-    h.push_back(row("F6", "Filter suspicious-low", C_FG));
-    h.push_back(row("Q", "Quit", C_RED));
+    h.push_back(row("Tab",
+                    "Switch Tabs (Addr, Map, CG, Watch, Ptr, Disasm, Struct)",
+                    C_CYAN));
+    h.push_back(row("F3", "Toggle Hex / Disassembler view", C_CYAN));
+    h.push_back(row("F4", "Attach to Process PID", C_FG));
+    h.push_back(row("F5", "Freeze / Unfreeze selected address", C_CYAN));
+    h.push_back(row("F6", "Toggle filtering of low addresses", C_FG));
+    h.push_back(row("F10", "Speedhack multiplier settings", C_YELLOW));
+    h.push_back(row("F11", "Pause / Resume process (SIGSTOP/CONT)", C_ACCENT));
+    h.push_back(row("F12 / K", "Kill process (with confirmation)", C_RED));
+    h.push_back(row("Q", "Quit tool", C_RED));
     h.push_back(separatorLight());
     h.push_back(
-        text(" GHIDRA: Copy Offset → Ghidra G (Go To) → imageBase+offset") |
+        text(" GHIDRA: Copy Offset -> Ghidra G (Go To) -> imageBase+offset") |
         color(C_YELLOW));
-    h.push_back(
-        text(" E exports a Python script, run in Ghidra Script Manager") |
-        color(C_DIM));
-    h.push_back(text(" Thanks to developers: myster_gif") | color(C_CYAN));
+    h.push_back(text(" 'E' exports a Python script for Ghidra Script Manager") |
+                color(C_DIM));
+    h.push_back(text(" Developed by: mystergaif (IxeRam project)") |
+                color(C_CYAN));
     h.push_back(separatorDouble());
     h.push_back(text(" ESC to close ") | hcenter | color(C_DIM));
     return vbox(std::move(h)) | size(WIDTH, EQUAL, 66) | borderDouble |
@@ -1109,6 +1171,21 @@ void TUI::run() {
       base = dbox({base, patch_modal_r->Render() | center});
     if (show_speedhack_modal)
       base = dbox({base, speedhack_modal_r->Render() | center});
+    if (show_kill_modal) {
+      auto modal =
+          vbox({text("⚠️  KILL PROCESS confirmation") | bold | color(C_RED) |
+                    hcenter,
+                separator(),
+                text("Are you sure you want to KILL PID " +
+                     std::to_string(engine.get_pid()) + "?") |
+                    hcenter,
+                text("This action is irreversible.") | hcenter | color(C_DIM),
+                separator(),
+                hbox({text(" [ENTER] Confirm kill ") | color(C_RED) | bold,
+                      filler(), text(" [ESC] Cancel ") | color(C_DIM)})}) |
+          borderRounded | color(C_FG) | size(WIDTH, GREATER_THAN, 40);
+      base = dbox({base, modal | center});
+    }
     return base;
   });
 
@@ -1318,21 +1395,27 @@ void TUI::run() {
       if (ev == Event::Return) {
         try {
           double spd = std::stod(speedhack_input);
-          std::string cmd =
-              "mkdir -p /dev/shm && head -c 8 /dev/zero > /dev/shm/speedhack_" +
-              std::to_string(engine.get_pid()); // Create if not exists
-          system(cmd.c_str());
-          FILE *f =
-              fopen(("/dev/shm/speedhack_" + std::to_string(engine.get_pid()))
-                        .c_str(),
-                    "wb");
-          if (f) {
-            fwrite(&spd, sizeof(double), 1, f);
-            fclose(f);
-            add_log("✓ Speedhack set to " + speedhack_input +
-                    "x (Ensure libspeedhack.so is preloaded via LD_PRELOAD)");
+          std::string shm_name =
+              "/speedhack_" + std::to_string(engine.get_pid());
+          int shm_fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
+          if (shm_fd != -1) {
+            ftruncate(shm_fd, sizeof(double));
+            void *ptr = mmap(NULL, sizeof(double), PROT_READ | PROT_WRITE,
+                             MAP_SHARED, shm_fd, 0);
+            if (ptr != MAP_FAILED) {
+              memcpy(ptr, &spd, sizeof(double));
+              munmap(ptr, sizeof(double));
+            }
+            close(shm_fd);
+            std::string shm_full_path =
+                "/dev/shm/speedhack_" + std::to_string(engine.get_pid());
+            chmod(shm_full_path.c_str(), 0666);
+            add_log("✓ Speedhack set to " + speedhack_input + "x");
+            add_log("  (Run app: "
+                    "LD_PRELOAD=/home/myster_gaif/Documents/C_C++/"
+                    "low-lewel_game_engine/build/libspeedhack.so ./app)");
           } else {
-            add_log("✗ Failed to write speedhack config");
+            add_log("✗ Speedhack error: SHM open failed");
           }
         } catch (...) {
           add_log("✗ Invalid speed");
@@ -1347,7 +1430,35 @@ void TUI::run() {
       return input_speedhack->OnEvent(ev);
     }
 
+    if (show_kill_modal) {
+      if (ev == Event::Return) {
+        if (engine.kill_process()) {
+          add_log("💀 Process Killed (SIGKILL)");
+        } else {
+          add_log("✗ Failed to kill process");
+        }
+        show_kill_modal = false;
+        return true;
+      }
+      if (ev == Event::Escape) {
+        show_kill_modal = false;
+        return true;
+      }
+      return true;
+    }
+
+    if (ev == Event::Character('k') || ev == Event::Character('K') ||
+        ev == Event::F12) {
+      if (engine.get_pid() > 0) {
+        show_kill_modal = true;
+      } else {
+        add_log("✗ No process attached");
+      }
+      return true;
+    }
+
     if (ev == Event::Character('q') || ev == Event::Character('Q')) {
+      engine.detach();
       screen.ExitLoopClosure()();
       return true;
     }
@@ -1379,12 +1490,18 @@ void TUI::run() {
           size_t sz = valueTypeSize(scanner.get_value_type());
           FrozenEntry fe;
           fe.bytes.resize(sz, 0);
-          engine.read_memory(tracked_address, fe.bytes.data(), sz);
-          fe.display_val = scanner.read_value_str(tracked_address);
-          frozen_addresses[tracked_address] = fe;
-          add_log("❄ Frozen " + hex_str(tracked_address) + " = " +
-                  fe.display_val);
+          if (engine.read_memory(tracked_address, fe.bytes.data(), sz)) {
+            fe.display_val = scanner.read_value_str(tracked_address);
+            frozen_addresses[tracked_address] = fe;
+            add_log("❄ Frozen " + hex_str(tracked_address) + " = " +
+                    fe.display_val);
+          } else {
+            add_log("✗ Freeze failed: cannot read 0x" +
+                    hex_str(tracked_address));
+          }
         }
+      } else {
+        add_log("✗ No address selected to freeze. Scan and select one first.");
       }
       return true;
     }
@@ -1418,6 +1535,20 @@ void TUI::run() {
       show_speedhack_modal = true;
       return true;
     }
+    if (ev == Event::F11) {
+      if (engine.get_pid() > 0) {
+        if (engine.is_paused()) {
+          if (engine.resume_process())
+            add_log("▶ Process Resumed");
+        } else {
+          if (engine.pause_process())
+            add_log("⏸ Process Paused (Frozen)");
+        }
+      } else
+        add_log("✗ No process attached");
+      return true;
+    }
+    // Moved to modal section above
     if (ev == Event::Character('w') || ev == Event::Character('W')) {
       if (tracked_address) {
         write_value_input.clear();
@@ -1456,6 +1587,26 @@ void TUI::run() {
       export_ghidra_script(path);
       return true;
     }
+    if (ev == Event::Character('x') || ev == Event::Character('X')) {
+      std::ofstream out("ixeram_results.json");
+      out << "[\n";
+      for (size_t i = 0; i < categorized_results.size(); ++i) {
+        auto &r = categorized_results[i];
+        out << "  {\n"
+            << "    \"address\": \"0x" << std::hex << r.addr << "\",\n"
+            << "    \"module\": \"" << r.module_name << "\",\n"
+            << "    \"offset\": \"0x" << std::hex << (r.addr - r.base_addr)
+            << "\"\n"
+            << "  }";
+        if (i < categorized_results.size() - 1)
+          out << ",";
+        out << "\n";
+      }
+      out << "]\n";
+      add_log("✓ Exported " + std::to_string(categorized_results.size()) +
+              " results to ixeram_results.json");
+      return true;
+    }
     if (ev == Event::Character('a') || ev == Event::Character('A')) {
       if (tracked_address) {
         watch_desc_input.clear();
@@ -1465,6 +1616,14 @@ void TUI::run() {
     }
     if (ev == Event::Character('p') || ev == Event::Character('P')) {
       do_ptr_scan();
+      return true;
+    }
+    if (ev == Event::Character('l') || ev == Event::Character('L')) {
+      scanner.aligned_scan = !scanner.aligned_scan;
+      add_log(
+          "Aligned Scan: " + std::string(scanner.aligned_scan ? "ON" : "OFF") +
+          (scanner.aligned_scan ? " (Faster, 4-byte aligned)"
+                                : " (Slow, byte-by-byte)"));
       return true;
     }
     if (ev == Event::Tab || ev == Event::Character('\t')) {

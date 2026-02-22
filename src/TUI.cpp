@@ -131,66 +131,84 @@ void TUI::update_tracking_data() {
   }
 
   auto regions = engine.update_maps();
-  categorized_results.clear();
+  // Sort regions by start address to allow binary search
+  std::sort(regions.begin(), regions.end(),
+            [](const auto &a, const auto &b) { return a.start < b.start; });
 
-  for (const auto &sr : raw) {
-    AddressType atype = AddressType::Other;
-    int score = 10;
-    std::string mod_name, mod_full;
-    uintptr_t base = 0;
-    uintptr_t f_off = 0;
+  // Only re-categorize ALL if the result count changed or it's the first time
+  static size_t last_raw_size = 0;
+  bool full_update = (raw.size() != last_raw_size);
+  last_raw_size = raw.size();
 
-    for (const auto &reg : regions) {
-      if (sr.address >= reg.start && sr.address < reg.end) {
-        base = reg.start;
-        f_off = reg.file_offset;
-        mod_full = reg.pathname;
-        size_t sl = reg.pathname.find_last_of('/');
-        mod_name = (sl != std::string::npos) ? reg.pathname.substr(sl + 1)
-                                             : reg.pathname;
-        if (mod_name.empty())
-          mod_name = "[anon]";
+  if (full_update) {
+    categorized_results.clear();
+    categorized_results.reserve(raw.size());
 
-        if (reg.permissions.find('x') != std::string::npos) {
-          atype = AddressType::Code;
-          score += 60;
-        } else if (reg.pathname.find("[heap]") != std::string::npos) {
-          atype = AddressType::Heap;
-          score += 30;
-        } else if (reg.pathname.find("[stack]") != std::string::npos) {
-          atype = AddressType::Stack;
-          score += 5;
-        } else if (!reg.pathname.empty()) {
-          atype = AddressType::Data;
-          score += 40;
+    for (const auto &sr : raw) {
+      AddressType atype = AddressType::Other;
+      int score = 10;
+      std::string mod_name = "[anon]";
+      uintptr_t base = 0;
+      uintptr_t f_off = 0;
+
+      // Binary search for the region
+      auto it = std::upper_bound(
+          regions.begin(), regions.end(), sr.address,
+          [](uintptr_t addr, const auto &reg) { return addr < reg.start; });
+
+      if (it != regions.begin()) {
+        const auto &reg = *(--it);
+        if (sr.address >= reg.start && sr.address < reg.end) {
+          base = reg.start;
+          f_off = reg.file_offset;
+          size_t sl = reg.pathname.find_last_of('/');
+          mod_name = (sl != std::string::npos) ? reg.pathname.substr(sl + 1)
+                                               : reg.pathname;
+          if (mod_name.empty())
+            mod_name = "[anon]";
+
+          if (reg.permissions.find('x') != std::string::npos) {
+            atype = AddressType::Code;
+            score += 60;
+          } else if (reg.pathname.find("[heap]") != std::string::npos) {
+            atype = AddressType::Heap;
+            score += 30;
+          } else if (reg.pathname.find("[stack]") != std::string::npos) {
+            atype = AddressType::Stack;
+            score += 5;
+          } else if (!reg.pathname.empty()) {
+            atype = AddressType::Data;
+            score += 40;
+          }
         }
-        break;
       }
+      categorized_results.push_back(
+          {sr.address, atype, score, mod_name, base, f_off});
     }
-    categorized_results.push_back(
-        {sr.address, atype, score, mod_name, base, f_off});
-  }
 
-  std::sort(
-      categorized_results.begin(), categorized_results.end(),
-      [](const auto &a, const auto &b) { return (int)a.type < (int)b.type; });
+    // Sort by type only when results change
+    std::sort(
+        categorized_results.begin(), categorized_results.end(),
+        [](const auto &a, const auto &b) { return (int)a.type < (int)b.type; });
+  }
 
   if (selected_result_idx >= (int)categorized_results.size())
     selected_result_idx = 0;
-  if (!categorized_results.empty())
+
+  if (!categorized_results.empty()) {
     tracked_address = categorized_results[selected_result_idx].addr;
+    double cur = read_as_double(tracked_address);
+    value_history.push_back((float)cur);
+    if (value_history.size() > 120)
+      value_history.erase(value_history.begin());
 
-  double cur = read_as_double(tracked_address);
-  value_history.push_back((float)cur);
-  if (value_history.size() > 120)
-    value_history.erase(value_history.begin());
+    hex_dump.resize(512, 0);
+    engine.read_memory(tracked_address, hex_dump.data(), 512);
+    if (show_disasm || main_tab == 5)
+      update_disasm();
+  }
 
-  hex_dump.resize(512, 0);
-  engine.read_memory(tracked_address, hex_dump.data(), 512);
-  if (show_disasm || main_tab == 5)
-    update_disasm();
-
-  // Update Watchlist cached values
+  // Update Watchlist cached values (always do this for real-time)
   for (auto &we : watchlist) {
     we.cached_val = scanner.read_value_str(we.addr);
   }

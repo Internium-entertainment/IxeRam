@@ -1,9 +1,9 @@
 #pragma once
 
 #include "MemoryEngine.hpp"
+#include <atomic>
 #include <cstdint>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 // ─── Scan Mode ───────────────────────────────────────────────────────────────
@@ -101,7 +101,7 @@ inline size_t valueTypeSize(ValueType vt) {
 // ─── Scan Result ─────────────────────────────────────────────────────────────
 struct ScanResult {
   uintptr_t address;
-  std::vector<uint8_t> prev_value; // raw bytes of last known value
+  uint8_t prev_value[8]; // Enough for all primitive types
 };
 
 // ─── Scanner ─────────────────────────────────────────────────────────────────
@@ -130,6 +130,9 @@ public:
   // Write a value to address (string -> bytes according to current type)
   bool write_value(uintptr_t address, const std::string &value_str);
 
+  // Aligned scanning (performance)
+  bool aligned_scan = true;
+
 private:
   MemoryEngine &engine;
   std::vector<ScanResult> results;
@@ -157,4 +160,12 @@ public:
   std::vector<PointerPath> find_pointers(uintptr_t target_addr,
                                          int max_depth = 2,
                                          int max_offset = 1024);
+
+  // ─── Parallel / Async Support ────────────────────────────────────────
+  float get_progress() const { return progress.load(); }
+  bool is_scanning() const { return scanning_active.load(); }
+
+private:
+  std::atomic<float> progress{0.0f};
+  std::atomic<bool> scanning_active{false};
 };
