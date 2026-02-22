@@ -5,6 +5,7 @@
 #include "ftxui/component/screen_interactive.hpp"
 #include <capstone/capstone.h>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -34,9 +35,12 @@ private:
   std::string speedhack_input = "1.0"; // Speedhack multiplier
   std::string struct_base_addr_input;  // Structure dissector base
   std::vector<std::string> logs;
+  std::mutex logs_mutex;
   int selected_result_idx = 0;
   int selected_map_idx = 0;
   int selected_cg_idx = 0; // selected node in call graph list
+  std::string target_process_name = "OFFLINE";
+  std::recursive_mutex ui_mutex;
 
   // ─── Scan selection ─────────────────────────────────────────────────
   int selected_value_type_idx = 2; // Int32
@@ -52,21 +56,24 @@ private:
       ValueType::Float64, ValueType::Bool,    ValueType::AOB,
       ValueType::String,  ValueType::String16};
   static constexpr const char *SCAN_TYPE_NAMES[] = {
-      "Exact Value",  "Not Equal", "Bigger Than",  "Smaller Than", "Increased",
-      "Increased By", "Decreased", "Decreased By", "Changed",      "Unchanged"};
+      "Exact Value",  "Not Equal", "Bigger Than",  "Smaller Than",
+      "Between",      "Increased", "Increased By", "Decreased",
+      "Decreased By", "Changed",   "Unchanged"};
   static constexpr ScanType SCAN_TYPES[] = {
-      ScanType::ExactValue,  ScanType::NotEqual,    ScanType::BiggerThan,
-      ScanType::SmallerThan, ScanType::Increased,   ScanType::IncreasedBy,
-      ScanType::Decreased,   ScanType::DecreasedBy, ScanType::Changed,
-      ScanType::Unchanged};
+      ScanType::ExactValue,  ScanType::NotEqual,  ScanType::BiggerThan,
+      ScanType::SmallerThan, ScanType::Between,   ScanType::Increased,
+      ScanType::IncreasedBy, ScanType::Decreased, ScanType::DecreasedBy,
+      ScanType::Changed,     ScanType::Unchanged};
   static constexpr int VALUE_TYPE_COUNT = 14;
-  static constexpr int SCAN_TYPE_COUNT = 10;
+  static constexpr int SCAN_TYPE_COUNT = 11;
 
   // ─── Real-time tracking ─────────────────────────────────────────────
   uintptr_t tracked_address = 0;
   std::vector<float> value_history;
   std::vector<uint8_t> hex_dump;
   std::map<uintptr_t, double> last_vals_for_color;
+  std::map<uintptr_t, std::string> cached_address_values;
+  std::map<uintptr_t, double> cached_address_doubles;
 
   struct FrozenEntry {
     std::vector<uint8_t> bytes;
@@ -170,9 +177,29 @@ private:
   bool show_struct_modal = false;
   bool show_speedhack_modal = false;
   bool show_kill_modal = false;
+  bool show_autoattach_modal = false; // #10: auto-attach by name
+  bool show_save_ct_modal = false;    // #2: cheat table save
+  bool show_load_ct_modal = false;    // #2: cheat table load
+  bool show_bp_list_modal = false;    // #7: breakpoint list
+  bool show_record_modal = false;     // #8: recording controls
 
   std::string ghidra_base_input;
   std::string watch_desc_input;
+  std::string autoattach_name_input; // #10: process name for auto-attach
+  std::string ct_path_input = "session.ixeram"; // #2: cheat table file path
+  std::string between_min_input;                // #3: Between scan min
+  std::string between_max_input;                // #3: Between scan max
+
+  // ─── Record / Playback (#8) ─────────────────────────────────────────
+  bool record_playing = false;
+  size_t record_play_idx = 0;
+  std::chrono::steady_clock::time_point record_start;
+
+  // ─── Breakpoint Access Records (#7) ─────────────────────────────────
+  std::vector<AccessRecord> bp_hits; // accumulated from engine.access_records
+  std::mutex bp_mutex;
+  int selected_bp_idx = 0;
+  bool show_access_tab = false; // sub-view inside Disasm tab
 
   // ─── Helpers ────────────────────────────────────────────────────────
   void add_log(const std::string &message);
@@ -181,6 +208,10 @@ private:
   void freezing_loop();
   std::string addr_type_str(AddressType t) const;
   double read_as_double(uintptr_t addr) const;
+
+  // Cheat Table save/load
+  bool save_cheat_table(const std::string &path);
+  bool load_cheat_table(const std::string &path);
 
   // Ghidra export
   void export_ghidra_script(const std::string &path);

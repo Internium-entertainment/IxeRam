@@ -28,11 +28,22 @@ constexpr ScanType TUI::SCAN_TYPES[];
 // ─── ctor / dtor ─────────────────────────────────────────────────────────
 TUI::TUI(MemoryEngine &e, Scanner &s) : engine(e), scanner(s) {
   add_log("Memory Inspector ready. Attach a PID to begin.");
+  if (engine.get_pid() != -1) {
+    std::string comm_path =
+        "/proc/" + std::to_string(engine.get_pid()) + "/comm";
+    std::ifstream comm_file(comm_path);
+    if (comm_file) {
+      std::getline(comm_file, target_process_name);
+    } else {
+      target_process_name = "PID " + std::to_string(engine.get_pid());
+    }
+  }
 }
 TUI::~TUI() {}
 
 // ─── Logging ─────────────────────────────────────────────────────────────
 void TUI::add_log(const std::string &msg) {
+  std::lock_guard<std::mutex> lock(logs_mutex);
   logs.push_back("◈ " + msg);
   if (logs.size() > 80)
     logs.erase(logs.begin());
@@ -124,6 +135,8 @@ std::string TUI::addr_type_str(AddressType t) const {
 
 // ─── update_tracking_data ────────────────────────────────────────────────
 void TUI::update_tracking_data() {
+  if (scanner.is_scanning())
+    return;
   auto &raw = scanner.get_results();
   if (raw.empty()) {
     categorized_results.clear();
@@ -140,9 +153,13 @@ void TUI::update_tracking_data() {
   bool full_update = (raw.size() != last_raw_size);
   last_raw_size = raw.size();
 
+  // We'll prepare new data in local variables first to minimize lock time
+  std::vector<CategorizedAddress> temp_results;
+  std::map<uintptr_t, std::string> temp_values;
+  std::map<uintptr_t, double> temp_doubles;
+
   if (full_update) {
-    categorized_results.clear();
-    categorized_results.reserve(raw.size());
+    temp_results.reserve(raw.size());
 
     for (const auto &sr : raw) {
       AddressType atype = AddressType::Other;
@@ -182,41 +199,81 @@ void TUI::update_tracking_data() {
           }
         }
       }
-      categorized_results.push_back(
-          {sr.address, atype, score, mod_name, base, f_off});
+      temp_results.push_back({sr.address, atype, score, mod_name, base, f_off});
     }
 
     // Sort by type only when results change
     std::sort(
-        categorized_results.begin(), categorized_results.end(),
+        temp_results.begin(), temp_results.end(),
         [](const auto &a, const auto &b) { return (int)a.type < (int)b.type; });
   }
 
-  if (selected_result_idx >= (int)categorized_results.size())
-    selected_result_idx = 0;
+  {
+    std::lock_guard<std::recursive_mutex> lock(ui_mutex);
+    if (full_update) {
+      categorized_results = std::move(temp_results);
+    }
 
-  if (!categorized_results.empty()) {
-    tracked_address = categorized_results[selected_result_idx].addr;
+    if (selected_result_idx >= (int)categorized_results.size())
+      selected_result_idx = 0;
+
+    if (!categorized_results.empty() && main_tab == 0) {
+      tracked_address = categorized_results[selected_result_idx].addr;
+    }
+  }
+
+  if (tracked_address != 0) {
     double cur = read_as_double(tracked_address);
-    value_history.push_back((float)cur);
-    if (value_history.size() > 120)
-      value_history.erase(value_history.begin());
+    {
+      std::lock_guard<std::recursive_mutex> lock(ui_mutex);
+      value_history.push_back((float)cur);
+      if (value_history.size() > 120)
+        value_history.erase(value_history.begin());
+    }
 
     hex_dump.resize(512, 0);
     engine.read_memory(tracked_address, hex_dump.data(), 512);
-    if (show_disasm || main_tab == 5)
+
+    // Update disasm only if strictly needed or if on disasm tab
+    if (show_disasm || main_tab == 5) {
       update_disasm();
+    }
+  }
+
+  // Batch read values for the current visible window to avoid hundreds of
+  // syscalls in UI This is a heuristic: we update the values of the few
+  // addresses around selection
+  {
+    std::lock_guard<std::recursive_mutex> lock(ui_mutex);
+    int start = std::max(0, selected_result_idx - 50);
+    int end =
+        std::min((int)categorized_results.size(), selected_result_idx + 50);
+
+    // Clear old cache if raw size changed significantly to avoid map growth
+    if (full_update && categorized_results.size() < 1000) {
+      cached_address_values.clear();
+      cached_address_doubles.clear();
+    }
+
+    for (int i = start; i < end; ++i) {
+      uintptr_t a = categorized_results[i].addr;
+      cached_address_doubles[a] = read_as_double(a);
+      cached_address_values[a] = scanner.read_value_str(a);
+    }
   }
 
   // Update Watchlist cached values (always do this for real-time)
-  for (auto &we : watchlist) {
-    we.cached_val = scanner.read_value_str(we.addr);
+  {
+    std::lock_guard<std::recursive_mutex> lock(ui_mutex);
+    for (auto &we : watchlist) {
+      we.cached_val = scanner.read_value_str(we.addr);
+    }
   }
 }
 
 // ─── update_memory_map ──────────────────────────────────────────────────
 void TUI::update_memory_map() {
-  map_entries.clear();
+  std::vector<MapEntry> temp;
   auto regions = engine.update_maps();
   for (const auto &reg : regions) {
     MapEntry e;
@@ -241,35 +298,45 @@ void TUI::update_memory_map() {
     e.is_stack = path.find("[stack]") != std::string::npos;
     e.is_heap = path.find("[heap]") != std::string::npos;
     e.is_code = reg.permissions.find('x') != std::string::npos;
-    map_entries.push_back(e);
+    temp.push_back(e);
   }
+  std::lock_guard<std::recursive_mutex> lock(ui_mutex);
+  map_entries = std::move(temp);
 }
 
 // ─── update_disasm ──────────────────────────────────────────────────────
 void TUI::update_disasm() {
-  csh handle;
-  if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
+  static csh handle = 0;
+  static bool cs_init = false;
+  if (!cs_init) {
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
+      return;
+    cs_init = true;
+  }
+
+  if (hex_dump.empty())
     return;
+
   cs_insn *insn;
   size_t count = cs_disasm(handle, hex_dump.data(), hex_dump.size(),
                            tracked_address, 0, &insn);
+
+  std::lock_guard<std::recursive_mutex> lock(ui_mutex);
   disasm_lines.clear();
   if (count > 0) {
     for (size_t i = 0; i < count && i < 35; ++i) {
-      std::string bytes_str;
-      for (int j = 0; j < insn[i].size; j++) {
-        char buf[4];
-        snprintf(buf, sizeof(buf), "%02X ", insn[i].bytes[j]);
-        bytes_str += buf;
+      char bytes_str[64] = {0};
+      for (int j = 0; j < insn[i].size && j < 16; j++) {
+        sprintf(bytes_str + strlen(bytes_str), "%02X ", insn[i].bytes[j]);
       }
       disasm_lines.push_back({insn[i].address, insn[i].mnemonic, insn[i].op_str,
                               bytes_str, insn[i].size});
     }
     cs_free(insn, count);
   } else {
-    disasm_lines.push_back({0, "ERR", "Cannot disassemble this region", "", 0});
+    disasm_lines.push_back(
+        {tracked_address, "???", "Invalid or unreadable memory", "", 1});
   }
-  cs_close(&handle);
 }
 
 // ─── freeze loop ─────────────────────────────────────────────────────────
@@ -500,4 +567,136 @@ void TUI::export_ghidra_script(const std::string &path) {
 
   f.close();
   add_log("✓ Ghidra script → " + path);
+}
+
+// ─── Cheat Table Save ────────────────────────────────────────────────────
+// Format: simple JSON-like file for portability
+bool TUI::save_cheat_table(const std::string &path) {
+  std::ofstream f(path);
+  if (!f) {
+    add_log("✗ Cannot save cheat table to " + path);
+    return false;
+  }
+
+  f << "{\n";
+  f << "  \"pid\": " << engine.get_pid() << ",\n";
+  f << "  \"ghidra_base\": " << ghidra_image_base << ",\n";
+  f << "  \"value_type\": " << (int)scanner.get_value_type() << ",\n";
+
+  for (size_t i = 0; i < watchlist.size(); ++i) {
+    const auto &we = watchlist[i];
+    std::string clean_desc = we.description;
+    std::replace(clean_desc.begin(), clean_desc.end(), '"', '\'');
+    f << "    {\"addr\": " << we.addr << ", \"type\": " << (int)we.type
+      << ", \"frozen\": " << (we.frozen ? "true" : "false") << ", \"desc\": \""
+      << clean_desc << "\"}";
+    if (i + 1 < watchlist.size())
+      f << ",";
+    f << "\n";
+  }
+  f << "  ],\n";
+
+  // Frozen addresses (addr + value bytes as hex)
+  f << "  \"frozen\": [\n";
+  size_t fi = 0;
+  for (auto &[addr, fe] : frozen_addresses) {
+    f << "    {\"addr\": " << addr << ", \"bytes\": \"";
+    for (uint8_t b : fe.bytes) {
+      char tmp[4];
+      snprintf(tmp, sizeof(tmp), "%02X", b);
+      f << tmp;
+    }
+    f << "\", \"val\": \"" << fe.display_val << "\"}";
+    if (++fi < frozen_addresses.size())
+      f << ",";
+    f << "\n";
+  }
+  f << "  ],\n";
+
+  // Pointer results (from scanner cache)
+  f << "  \"pointers\": [\n";
+  for (size_t i = 0; i < scanner.find_pointers_cache.size(); ++i) {
+    const auto &p = scanner.find_pointers_cache[i];
+    f << "    {\"module\": \"" << p.module_name << "\", \"base\": " << std::hex
+      << p.base_module_addr << std::dec << ", \"offsets\": [";
+    for (size_t j = 0; j < p.offsets.size(); ++j) {
+      f << p.offsets[j];
+      if (j + 1 < p.offsets.size())
+        f << ", ";
+    }
+    f << "]}";
+    if (i + 1 < scanner.find_pointers_cache.size())
+      f << ",";
+    f << "\n";
+  }
+  f << "  ]\n";
+  f << "}\n";
+
+  add_log("✓ Cheat Table saved → " + path);
+  return true;
+}
+
+bool TUI::load_cheat_table(const std::string &path) {
+  std::ifstream f(path);
+  if (!f) {
+    add_log("✗ Cannot load cheat table from " + path);
+    return false;
+  }
+
+  // Simple line-by-line parser (no full JSON parser needed for our format)
+  std::string content((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+  f.close();
+
+  watchlist.clear();
+  frozen_addresses.clear();
+
+  // Parse ghidra_base
+  {
+    auto pos = content.find("\"ghidra_base\": ");
+    if (pos != std::string::npos) {
+      pos += 15;
+      try {
+        ghidra_image_base = std::stoull(content.substr(pos));
+      } catch (...) {
+      }
+    }
+  }
+
+  // Parse watchlist entries line by line (simple approach)
+  {
+    size_t start = content.find("\"watchlist\":");
+    size_t end = content.find("\"frozen\":");
+    if (start != std::string::npos && end != std::string::npos) {
+      std::string wl_block = content.substr(start, end - start);
+      std::istringstream ss(wl_block);
+      std::string line;
+      while (std::getline(ss, line)) {
+        auto fa = line.find("\"addr\": ");
+        auto ft = line.find("\"type\": ");
+        auto fd = line.find("\"desc\": \"");
+        if (fa == std::string::npos || ft == std::string::npos)
+          continue;
+        WatchEntry we;
+        try {
+          we.addr = std::stoull(line.substr(fa + 8));
+          we.type = (ValueType)std::stoi(line.substr(ft + 8));
+          if (fd != std::string::npos) {
+            size_t ds = fd + 9;
+            size_t de = line.find("\"", ds);
+            if (de != std::string::npos)
+              we.description = line.substr(ds, de - ds);
+          }
+          we.frozen = line.find("\"frozen\": true") != std::string::npos;
+          we.cached_val = "?";
+          watchlist.push_back(we);
+        } catch (...) {
+        }
+      }
+    }
+  }
+
+  add_log("✓ Cheat Table loaded ← " + path + " (" +
+          std::to_string(watchlist.size()) + " watch entries)");
+  return true;
 }

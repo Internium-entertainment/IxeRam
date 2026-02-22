@@ -2,6 +2,7 @@
 
 #include "MemoryEngine.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@ enum class ScanType {
   NotEqual,    // != value
   BiggerThan,  // >  value
   SmallerThan, // <  value
+  Between,     // min <= value <= max
   Increased,   // increased since last scan (any amount)
   IncreasedBy, // increased by exact amount
   Decreased,   // decreased since last scan (any amount)
@@ -104,6 +106,13 @@ struct ScanResult {
   uint8_t prev_value[8]; // Enough for all primitive types
 };
 
+// ─── Value Record Entry
+// ───────────────────────────────────────────────────────
+struct ValueRecord {
+  std::chrono::steady_clock::time_point timestamp;
+  double value;
+};
+
 // ─── Scanner ─────────────────────────────────────────────────────────────────
 class Scanner {
 public:
@@ -112,8 +121,20 @@ public:
   // Perform 1st scan
   void initial_scan(ValueType type, const std::string &value_str);
 
+  // Perform unknown-initial-value scan (snapshot all writable RAM)
+  void unknown_initial_scan(ValueType type);
+
   // Perform subsequent refinement scan
+  // For Between: value_str = "min,max"
   void next_scan(ScanType scan_type, const std::string &value_str = "");
+
+  // Save/load pointer paths to file
+  bool save_ptr_results(const std::string &path) const;
+  bool load_ptr_results(const std::string &path);
+
+  // Record / playback
+  std::vector<ValueRecord> value_recording;
+  bool recording_active = false;
 
   // Array-of-Bytes
   void aob_scan(const std::string &pattern);
@@ -127,8 +148,9 @@ public:
   // Read current value at address as formatted string
   std::string read_value_str(uintptr_t address) const;
 
-  // Write a value to address (string -> bytes according to current type)
-  bool write_value(uintptr_t address, const std::string &value_str);
+  // Write a value to address (string -> bytes according to type)
+  bool write_value(uintptr_t address, const std::string &value_str,
+                   ValueType type);
 
   // Aligned scanning (performance)
   bool aligned_scan = true;
@@ -139,7 +161,8 @@ private:
   ValueType current_value_type = ValueType::Int32;
   bool first_scan = true;
 
-  std::vector<uint8_t> parse_value(const std::string &value_str) const;
+  std::vector<uint8_t> parse_value(const std::string &value_str,
+                                   ValueType type) const;
 
   template <typename T> void initial_scan_typed(T target);
 
@@ -160,10 +183,13 @@ public:
   std::vector<PointerPath> find_pointers(uintptr_t target_addr,
                                          int max_depth = 2,
                                          int max_offset = 1024);
+  // Cache of last pointer scan results (used for save/load)
+  mutable std::vector<PointerPath> find_pointers_cache;
 
   // ─── Parallel / Async Support ────────────────────────────────────────
   float get_progress() const { return progress.load(); }
   bool is_scanning() const { return scanning_active.load(); }
+  void set_scanning(bool val) { scanning_active.store(val); }
 
 private:
   std::atomic<float> progress{0.0f};

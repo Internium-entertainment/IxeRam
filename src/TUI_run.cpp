@@ -38,6 +38,15 @@ void TUI::run() {
   const auto C_YELLOW = Color::RGB(255, 220, 50);
   const auto C_SEL_BG = Color::RGB(30, 50, 90);
 
+  // ─── Scroll offsets for panels ───────────────────────────────────────
+  int sidebar_scroll = 0; // sidebar vertical scroll offset
+  int log_scroll = 0;     // log panel scroll offset (from bottom)
+  int center_scroll = 0;  // extra scroll for center panel (struct/watch)
+
+  // Helper: get terminal dims
+  auto term_rows = [&]() { return screen.dimy(); };
+  auto term_cols = [&]() { return screen.dimx(); };
+
   auto input_pid = Input(&pid_input, "PID...");
   auto input_scan = Input(&scan_value, "value...");
   auto input_next =
@@ -50,6 +59,10 @@ void TUI::run() {
   auto input_watch_desc = Input(&watch_desc_input, "Description...");
   auto input_struct_base = Input(&struct_base_addr_input, "0x...");
   auto input_speedhack = Input(&speedhack_input, "2.0 or 0.5...");
+  auto input_autoattach = Input(&autoattach_name_input, "process name...");
+  auto input_ct_path = Input(&ct_path_input, "session.ixeram");
+  auto input_between_min = Input(&between_min_input, "min...");
+  auto input_between_max = Input(&between_max_input, "max...");
 
   auto hex_str = [](uintptr_t v) {
     std::ostringstream s;
@@ -76,8 +89,17 @@ void TUI::run() {
 
   auto do_attach = [&] {
     try {
-      if (engine.attach(std::stoi(pid_input))) {
-        add_log("✓ Attached " + pid_input);
+      pid_t pid = std::stoi(pid_input);
+      if (engine.attach(pid)) {
+        // Update process name
+        std::string comm_path = "/proc/" + std::to_string(pid) + "/comm";
+        std::ifstream comm_file(comm_path);
+        if (comm_file) {
+          std::getline(comm_file, target_process_name);
+        } else {
+          target_process_name = "Process " + std::to_string(pid);
+        }
+        add_log("✓ Attached to " + target_process_name);
         update_memory_map();
       } else
         add_log("✗ Failed " + pid_input);
@@ -92,11 +114,12 @@ void TUI::run() {
   auto do_initial_scan = [&] {
     if (scanner.is_scanning())
       return;
+    scanner.set_scanning(true);
     add_log("⚡ Background Scan Started...");
-    std::thread([&] {
-      scanner.initial_scan(VALUE_TYPES[selected_value_type_idx], scan_value);
-      add_log("✓ Scan [" +
-              std::string(VALUE_TYPE_NAMES[selected_value_type_idx]) + "] → " +
+    std::thread([&, t = VALUE_TYPES[selected_value_type_idx], v = scan_value,
+                 n = std::string(VALUE_TYPE_NAMES[selected_value_type_idx])] {
+      scanner.initial_scan(t, v);
+      add_log("✓ Scan [" + n + "] → " +
               std::to_string(scanner.get_results().size()) + " results");
       screen.PostEvent(Event::Custom);
     }).detach();
@@ -106,11 +129,13 @@ void TUI::run() {
   auto do_next_scan = [&] {
     if (scanner.is_scanning())
       return;
+    scanner.set_scanning(true);
     add_log("⚡ Background Refinement Started...");
-    std::thread([&] {
-      scanner.next_scan(SCAN_TYPES[selected_scan_type_idx], next_scan_value);
-      add_log("✓ Next [" +
-              std::string(SCAN_TYPE_NAMES[selected_scan_type_idx]) + "] → " +
+    std::thread([&, st = SCAN_TYPES[selected_scan_type_idx],
+                 nv = next_scan_value,
+                 sn = std::string(SCAN_TYPE_NAMES[selected_scan_type_idx])] {
+      scanner.next_scan(st, nv);
+      add_log("✓ Next [" + sn + "] → " +
               std::to_string(scanner.get_results().size()) + " results");
       screen.PostEvent(Event::Custom);
     }).detach();
@@ -119,7 +144,8 @@ void TUI::run() {
 
   auto do_write = [&] {
     if (tracked_address) {
-      if (scanner.write_value(tracked_address, write_value_input))
+      if (scanner.write_value(tracked_address, write_value_input,
+                              VALUE_TYPES[selected_value_type_idx]))
         add_log("✓ Wrote " + write_value_input + " → " +
                 hex_str(tracked_address));
       else
@@ -169,12 +195,120 @@ void TUI::run() {
     if (tracked_address) {
       add_log("Pointer Scan for " + hex_str(tracked_address) + "...");
       ptr_results = scanner.find_pointers(tracked_address, 2, 1024);
+      scanner.find_pointers_cache = ptr_results; // cache for save
       add_log("✓ Found " + std::to_string(ptr_results.size()) +
               " pointer paths");
       main_tab = 4;
     } else
       add_log("✗ No address");
     show_ptr_modal = false;
+  };
+
+  // #10: Auto-attach by process name
+  auto do_autoattach = [&] {
+    if (autoattach_name_input.empty())
+      return;
+    add_log("⌚ Waiting for process: " + autoattach_name_input + "...");
+    std::thread([&] {
+      pid_t pid = MemoryEngine::wait_for_process(autoattach_name_input, 15000);
+      if (pid != -1) {
+        try {
+          if (engine.attach(pid)) {
+            target_process_name = autoattach_name_input;
+            add_log("✓ Auto-attached to '" + target_process_name +
+                    "' PID=" + std::to_string(pid));
+            update_memory_map();
+          } else
+            add_log("✗ Auto-attach failed: cannot access PID " +
+                    std::to_string(pid));
+        } catch (const std::exception &e) {
+          add_log("✗ " + std::string(e.what()));
+        }
+      } else {
+        add_log("✗ Process '" + autoattach_name_input +
+                "' not found (timeout)");
+      }
+      screen.PostEvent(Event::Custom);
+    }).detach();
+    show_autoattach_modal = false;
+    autoattach_name_input.clear();
+  };
+
+  // #8: Record toggle
+  auto do_record_toggle = [&] {
+    if (!scanner.recording_active) {
+      scanner.value_recording.clear();
+      scanner.recording_active = true;
+      record_start = std::chrono::steady_clock::now();
+      add_log("⏺ Recording started for " + hex_str(tracked_address));
+    } else {
+      scanner.recording_active = false;
+      add_log("⏹ Recording stopped. " +
+              std::to_string(scanner.value_recording.size()) + " samples");
+    }
+  };
+
+  // #8: Playback
+  auto do_start_playback = [&] {
+    if (scanner.value_recording.empty()) {
+      add_log("✗ No recording to play back");
+      return;
+    }
+    record_playing = true;
+    record_play_idx = 0;
+    add_log("▶ Playing back " + std::to_string(scanner.value_recording.size()) +
+            " samples");
+    std::thread([&] {
+      while (record_playing &&
+             record_play_idx < scanner.value_recording.size()) {
+        double v = scanner.value_recording[record_play_idx].value;
+        if (tracked_address) {
+          // Write value back to memory
+          float fv = (float)v;
+          engine.write_memory(tracked_address, &fv, sizeof(fv));
+        }
+        ++record_play_idx;
+        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60fps
+        screen.PostEvent(Event::Custom);
+      }
+      record_playing = false;
+      add_log("⏹ Playback finished");
+      screen.PostEvent(Event::Custom);
+    }).detach();
+  };
+
+  // #7: Set breakpoint on selected address
+  auto do_set_bp = [&] {
+    if (!tracked_address) {
+      add_log("✗ No address selected");
+      return;
+    }
+    if (engine.set_breakpoint(tracked_address)) {
+      add_log("⬤ Breakpoint set at " + hex_str(tracked_address));
+      add_log("  [Ctrl+B] to wait for hit (blocks briefly)");
+    } else {
+      add_log("✗ Failed to set breakpoint (need ptrace attach)");
+    }
+  };
+
+  // #7: Wait for breakpoint hit (non-blocking dispatch)
+  auto do_wait_bp = [&] {
+    add_log("⌚ Waiting for breakpoint hit...");
+    std::thread([&] {
+      uintptr_t hit = 0;
+      if (engine.wait_breakpoint(hit, 5000)) {
+        std::lock_guard<std::mutex> lock(bp_mutex);
+        // Copy newly recorded hits
+        bp_hits.insert(bp_hits.end(), engine.access_records.begin(),
+                       engine.access_records.end());
+        engine.access_records.clear();
+        add_log("⬤ Breakpoint hit at " + hex_str(hit));
+        tracked_address = hit;
+      } else {
+        add_log("✗ No breakpoint hit (timeout/no bp set)");
+      }
+      screen.PostEvent(Event::Custom);
+    }).detach();
   };
 
   // ──────────────────────────────────────────────────────────────────
@@ -184,35 +318,33 @@ void TUI::run() {
     static uint32_t fc = 0;
     fc++;
 
-    // Virtual list optimization: only build visible rows
-    int visible_count = 28;
-    int start_idx = std::max(0, selected_result_idx - visible_count / 2);
-    int end_idx =
-        std::min((int)categorized_results.size(), start_idx + visible_count);
-
-    // Batched read for visible addresses
-    std::vector<uintptr_t> visible_addrs;
-    for (int i = start_idx; i < end_idx; ++i) {
-      visible_addrs.push_back(categorized_results[i].addr);
-    }
-
-    // We read as double for color comparison and as formatted string for
-    // display
+    std::vector<CategorizedAddress> results_copy;
     std::unordered_map<uintptr_t, double> current_vals;
     std::unordered_map<uintptr_t, std::string> current_strs;
 
-    for (auto addr : visible_addrs) {
-      current_vals[addr] = read_as_double(addr);
-      current_strs[addr] = scanner.read_value_str(addr);
+    int visible_count = std::max(5, term_rows() - 14);
+    {
+      std::lock_guard<std::recursive_mutex> lock(ui_mutex);
+      if (categorized_results.empty())
+        return vbox(text(" No results ") | center);
+
+      // Copy only what we need for the current view window
+      int start_idx = std::max(0, selected_result_idx - visible_count / 2);
+      int end_idx =
+          std::min((int)categorized_results.size(), start_idx + visible_count);
+
+      for (int i = start_idx; i < end_idx; ++i) {
+        const auto &res = categorized_results[i];
+        results_copy.push_back(res);
+        current_vals[res.addr] = cached_address_doubles[res.addr];
+        current_strs[res.addr] = cached_address_values[res.addr];
+      }
     }
-    // Note: read_as_double and read_value_str still do individual reads for
-    // now, but we've significantly reduced overhead in the core scanner. To
-    // truly batch here we would need a batched version of read_value_str. Given
-    // the time, the scanner optimizations are the main win.
 
     Elements vis;
-    for (int i = start_idx; i < end_idx; ++i) {
-      const auto &res = categorized_results[i];
+    for (size_t i = 0; i < results_copy.size(); ++i) {
+      const auto &res = results_copy[i];
+      int global_idx = std::max(0, selected_result_idx - visible_count / 2) + i;
       if (hide_suspicious_low && res.suspicious_score < 30)
         continue;
 
@@ -263,7 +395,7 @@ void TUI::run() {
           text("[" + valueTypeName(scanner.get_value_type()) + "]") |
               color(C_ACCENT2) | size(WIDTH, EQUAL, 9),
           text(" "), text(vs) | color(cv) | bold | size(WIDTH, EQUAL, 14));
-      if (i == selected_result_idx)
+      if (global_idx == selected_result_idx)
         row = row | bgcolor(C_SEL_BG) | color(Color::White);
       vis.push_back(row);
     }
@@ -290,10 +422,21 @@ void TUI::run() {
                         text(" MODULE") | color(C_DIM) | bold) |
                    bgcolor(Color::RGB(20, 20, 35)));
     rows.push_back(separatorLight() | color(C_DIM));
-    int vs2 = std::max(0, selected_map_idx - 15),
-        ve = std::min((int)map_entries.size(), vs2 + 35);
-    for (int i = vs2; i < ve; ++i) {
-      const auto &e = map_entries[i];
+    int visible_map = std::max(5, term_rows() - 14);
+    int vs2 = 0, ve = 0;
+    std::vector<MapEntry> map_copy;
+    {
+      std::lock_guard<std::recursive_mutex> lock(ui_mutex);
+      if (map_entries.empty())
+        return text(" No map records ") | center;
+      vs2 = std::max(0, selected_map_idx - visible_map / 2);
+      ve = std::min((int)map_entries.size(), vs2 + visible_map);
+      for (int i = vs2; i < ve; ++i)
+        map_copy.push_back(map_entries[i]);
+    }
+    for (int i = 0; i < (int)map_copy.size(); ++i) {
+      int global_idx = vs2 + i;
+      const auto &e = map_copy[i];
       std::ostringstream ss, se, sz;
       ss << "0x" << std::hex << std::uppercase << std::setw(14)
          << std::setfill('0') << e.start;
@@ -320,7 +463,7 @@ void TUI::run() {
           text(" " + e.perms + " ") | color(e.is_code ? C_RED : C_DIM) |
               size(WIDTH, EQUAL, 6),
           text(" " + e.module) | color(mc) | bold);
-      if (i == selected_map_idx)
+      if (global_idx == selected_map_idx)
         row = row | bgcolor(C_SEL_BG) | color(Color::White);
       rows.push_back(row);
     }
@@ -349,10 +492,21 @@ void TUI::run() {
              text(" HEURISTIC NAME") | color(C_DIM) | bold) |
         bgcolor(Color::RGB(20, 20, 35)));
     rows.push_back(separatorLight() | color(C_DIM));
-    int vs2 = std::max(0, selected_cg_idx - 15),
-        ve = std::min((int)call_graph.size(), vs2 + 32);
-    for (int i = vs2; i < ve; ++i) {
-      const auto &n = call_graph[i];
+    int visible_cg = std::max(5, term_rows() - 14);
+    int vs2 = 0, ve = 0;
+    std::vector<CallNode> cg_copy;
+    {
+      std::lock_guard<std::recursive_mutex> lock(ui_mutex);
+      if (call_graph.empty())
+        return text(" No CG records ") | center;
+      vs2 = std::max(0, selected_cg_idx - visible_cg / 2);
+      ve = std::min((int)call_graph.size(), vs2 + visible_cg);
+      for (int i = vs2; i < ve; ++i)
+        cg_copy.push_back(call_graph[i]);
+    }
+    for (int i = 0; i < (int)cg_copy.size(); ++i) {
+      int global_idx = vs2 + i;
+      const auto &n = cg_copy[i];
       std::string ind(n.depth * 2, ' ');
       std::ostringstream sa, so;
       sa << "0x" << std::hex << std::uppercase << n.addr;
@@ -365,7 +519,7 @@ void TUI::run() {
                text(" " + so.str()) | color(C_ACCENT2) | size(WIDTH, EQUAL, 12),
                text(" " + n.module) | color(C_ORANGE) | size(WIDTH, EQUAL, 16),
                text(" " + ind + n.name) | color(nc) | bold);
-      if (i == selected_cg_idx)
+      if (global_idx == selected_cg_idx)
         row = row | bgcolor(C_SEL_BG) | color(Color::White);
       rows.push_back(row);
     }
@@ -436,52 +590,174 @@ void TUI::run() {
   });
 
   // ──────────────────────────────────────────────────────────────────
-  // DISASSEMBLER TAB
+  // DISASSEMBLER TAB  (#11: improved coloring)
   // ──────────────────────────────────────────────────────────────────
+  // Helper: colorize an operand string token-by-token
+  auto colorize_ops = [&](const std::string &ops) -> Element {
+    // Split on commas and brackets, color registers, immediates, mem refs
+    Elements parts;
+    std::string cur;
+    auto flush = [&]() {
+      if (cur.empty())
+        return;
+      // Registers: start with r/e and 2-3 chars, or known names
+      auto is_reg = [](const std::string &s) {
+        static const char *regs[] = {
+            "rax",  "rbx",  "rcx",  "rdx",    "rsi",  "rdi",  "rbp",  "rsp",
+            "r8",   "r9",   "r10",  "r11",    "r12",  "r13",  "r14",  "r15",
+            "eax",  "ebx",  "ecx",  "edx",    "esi",  "edi",  "ebp",  "esp",
+            "al",   "bl",   "cl",   "dl",     "ah",   "bh",   "ch",   "dh",
+            "ax",   "bx",   "cx",   "dx",     "si",   "di",   "bp",   "sp",
+            "xmm0", "xmm1", "xmm2", "xmm3",   "xmm4", "xmm5", "xmm6", "xmm7",
+            "ymm0", "ymm1", "rip",  "rflags", nullptr};
+        std::string sl = s;
+        for (auto &c : sl)
+          c = tolower(c);
+        for (int i = 0; regs[i]; ++i)
+          if (sl == regs[i])
+            return true;
+        return false;
+      };
+      // Immediate/hex: starts with 0x or minus or digit
+      bool is_imm =
+          (!cur.empty() && (cur[0] == '0' || cur[0] == '-' || isdigit(cur[0])));
+      // Memory reference: contains '['
+      bool is_mem = (cur.find('[') != std::string::npos);
+      Color oc = C_FG;
+      if (is_mem)
+        oc = Color::RGB(255, 200, 100);
+      else if (is_imm)
+        oc = Color::RGB(180, 130, 255);
+      else if (is_reg(cur))
+        oc = Color::RGB(100, 220, 255);
+      parts.push_back(text(cur) | color(oc));
+      cur.clear();
+    };
+    for (char c : ops) {
+      if (c == ',' || c == ' ' || c == '[' || c == ']') {
+        flush();
+        Color sc = (c == '[' || c == ']') ? Color::RGB(255, 200, 100) : C_DIM;
+        parts.push_back(text(std::string(1, c)) | color(sc));
+      } else {
+        cur += c;
+      }
+    }
+    flush();
+    if (parts.empty())
+      return text("");
+    return hbox(std::move(parts));
+  };
+
+  // Breakpoint hits tab (sub-view)
+  auto bp_hits_view = Renderer([&] {
+    std::lock_guard<std::mutex> lock(bp_mutex);
+    Elements rows;
+    rows.push_back(hbox(text(" RIP (hit addr)    ") | color(C_DIM) | bold |
+                            size(WIDTH, EQUAL, 20),
+                        text(" RAX              ") | color(C_DIM) | bold |
+                            size(WIDTH, EQUAL, 20),
+                        text(" RBX              ") | color(C_DIM) | bold |
+                            size(WIDTH, EQUAL, 20),
+                        text(" Write?") | color(C_DIM) | bold) |
+                   bgcolor(Color::RGB(20, 20, 35)));
+    rows.push_back(separatorLight() | color(C_DIM));
+    if (bp_hits.empty()) {
+      rows.push_back(
+          text(" No breakpoint hits yet. [Z] set bp, [Ctrl+Z] wait") |
+          color(C_DIM));
+    }
+    for (int i = 0; i < (int)bp_hits.size(); ++i) {
+      const auto &ar = bp_hits[i];
+      std::ostringstream sr, sa, sb;
+      sr << "0x" << std::hex << std::uppercase << ar.rip;
+      sa << "0x" << std::hex << std::uppercase << ar.rax;
+      sb << "0x" << std::hex << std::uppercase << ar.rbx;
+      auto row =
+          hbox(text(" " + sr.str()) | color(C_CYAN) | size(WIDTH, EQUAL, 20),
+               text(" " + sa.str()) | color(C_ACCENT) | size(WIDTH, EQUAL, 20),
+               text(" " + sb.str()) | color(C_ACCENT2) | size(WIDTH, EQUAL, 20),
+               text(ar.is_write ? " WRITE" : " READ") |
+                   color(ar.is_write ? C_RED : C_GREEN));
+      if (i == selected_bp_idx)
+        row = row | bgcolor(C_SEL_BG);
+      rows.push_back(row);
+    }
+    return vbox(std::move(rows));
+  });
+
   auto disasm_tab_r = Renderer([&] {
+    if (show_access_tab) {
+      return bp_hits_view->Render();
+    }
     if (disasm_lines.empty())
       return text(" ERR: No disassembly available here. ") | color(C_RED) |
              center;
     Elements rows;
     rows.push_back(hbox(text(" ADDRESS          ") | color(C_DIM) | bold,
                         text(" BYTES                 ") | color(C_DIM) | bold,
-                        text(" INSTRUCTION ") | color(C_DIM) | bold) |
+                        text(" MNEM     ") | color(C_DIM) | bold,
+                        text(" OPERANDS") | color(C_DIM) | bold) |
                    bgcolor(Color::RGB(20, 20, 35)));
     rows.push_back(separatorLight() | color(C_DIM));
 
-    int start_idx = std::max(0, selected_disasm_idx - 15);
+    int visible_disasm = std::max(5, term_rows() - 14);
+    int start_idx = std::max(0, selected_disasm_idx - visible_disasm / 2);
     for (int i = start_idx;
-         i < std::min((int)disasm_lines.size(), start_idx + 35); ++i) {
+         i < std::min((int)disasm_lines.size(), start_idx + visible_disasm);
+         ++i) {
       auto &l = disasm_lines[i];
       Color mc = C_ORANGE;
       if (!l.mnem.empty()) {
         char c0 = l.mnem[0];
-        if (c0 == 'j' || l.mnem == "call")
-          mc = C_RED;
-        else if (l.mnem == "mov" || l.mnem == "lea")
-          mc = C_CYAN;
+        if (c0 == 'j' && l.mnem != "jmp")
+          mc = Color::RGB(255, 140, 50); // conditional jumps: orange
+        else if (l.mnem == "jmp")
+          mc = Color::RGB(255, 80, 80); // unconditional jump: red
+        else if (l.mnem == "call")
+          mc = Color::RGB(255, 60, 180); // call: pink-red
+        else if (l.mnem == "mov" || l.mnem == "movsx" || l.mnem == "movzx" ||
+                 l.mnem == "movaps" || l.mnem == "movdqa")
+          mc = Color::RGB(80, 200, 255); // move: cyan
+        else if (l.mnem == "lea")
+          mc = Color::RGB(60, 230, 200); // lea: teal
         else if (l.mnem == "push" || l.mnem == "pop")
-          mc = C_ACCENT2;
-        else if (l.mnem == "ret")
-          mc = C_GREEN;
+          mc = Color::RGB(160, 100, 255); // stack: purple
+        else if (l.mnem == "ret" || l.mnem == "retn")
+          mc = Color::RGB(80, 255, 100); // ret: green
         else if (l.mnem == "nop")
           mc = C_DIM;
+        else if (l.mnem == "xor" || l.mnem == "and" || l.mnem == "or" ||
+                 l.mnem == "not" || l.mnem == "test")
+          mc = Color::RGB(255, 220, 80); // logical: yellow
+        else if (l.mnem == "add" || l.mnem == "sub" || l.mnem == "imul" ||
+                 l.mnem == "idiv" || l.mnem == "inc" || l.mnem == "dec")
+          mc = Color::RGB(255, 160, 80); // arithmetic: orange-yellow
+        else if (l.mnem == "cmp")
+          mc = Color::RGB(200, 200, 80); // compare: dim yellow
       }
       std::ostringstream ss;
       ss << "0x" << std::hex << std::uppercase << l.addr;
       bool is_node = cg_index.count(l.addr) > 0;
+      bool has_bp = (engine.get_pid() > 0); // could check bp map
 
       auto row = hbox(text(ss.str() + " ") | color(is_node ? C_YELLOW : C_DIM) |
                           size(WIDTH, EQUAL, 18),
                       text(l.bytes_hex) | color(C_DIM) | size(WIDTH, EQUAL, 23),
                       text(" "),
                       text(l.mnem) | color(mc) | bold | size(WIDTH, EQUAL, 8),
-                      text(l.ops) | color(is_node ? C_YELLOW : C_FG));
+                      colorize_ops(l.ops));
 
       if (i == selected_disasm_idx)
         row = row | bgcolor(C_SEL_BG);
       rows.push_back(row);
     }
+    // Status bar for disasm tab
+    rows.push_back(separatorLight() | color(C_DIM));
+    rows.push_back(hbox(
+        text(" [SPACE]patch ") | color(C_DIM),
+        text("[ENTER]jump ") | color(C_DIM), text("[BSPC]back ") | color(C_DIM),
+        text("[Z] Set BP ") | color(C_YELLOW),
+        text("[U] Access Log") | color(show_access_tab ? C_GREEN : C_DIM)));
     return vbox(std::move(rows));
   });
 
@@ -657,11 +933,27 @@ void TUI::run() {
            color(C_GREEN);
   });
 
-  auto log_view = Renderer([&] {
+  // Log panel height (rows visible in log box ~6 lines)
+  static constexpr int LOG_PANEL_ROWS = 6;
+  auto log_view = Renderer([&]() -> Element {
+    std::vector<std::string> log_copy;
+    {
+      std::lock_guard<std::mutex> lock(logs_mutex);
+      log_copy = logs;
+    }
     Elements l;
-    int s = std::max(0, (int)logs.size() - 6);
-    for (int i = s; i < (int)logs.size(); ++i)
-      l.push_back(text(logs[i]) | color(C_DIM));
+    int total_logs = (int)log_copy.size();
+    // log_scroll: 0 = bottom (latest), positive = scrolled up
+    int clamped_scroll =
+        std::min(log_scroll, std::max(0, total_logs - LOG_PANEL_ROWS));
+    int end_idx = total_logs - clamped_scroll;
+    int start_idx = std::max(0, end_idx - LOG_PANEL_ROWS);
+    for (int i = start_idx; i < end_idx; ++i)
+      l.push_back(text(log_copy[i]) | color(C_DIM));
+    if (clamped_scroll > 0)
+      l.push_back(text(" ↑ +" + std::to_string(clamped_scroll) +
+                       " more above (scroll up)") |
+                  color(C_ACCENT2) | dim);
     return vbox(std::move(l));
   });
 
@@ -676,21 +968,36 @@ void TUI::run() {
              color(sel ? Color::White : C_DIM) |
              (sel ? bgcolor(C_SEL_BG) : bgcolor(Color::Default));
     };
+    static uint32_t name_check_count = 0;
+    if (hp && target_process_name == "OFFLINE" &&
+        (name_check_count++ % 100 == 0)) {
+      std::string comm_path =
+          "/proc/" + std::to_string(engine.get_pid()) + "/comm";
+      std::ifstream comm_file(comm_path);
+      if (comm_file)
+        std::getline(comm_file, target_process_name);
+    }
+
+    // --- FIXED PART (Always visible) ---
+    auto fixed_part = vbox(
+        {hbox({text(" ◉ ") | color(hp ? C_GREEN : C_RED),
+               text(hp ? std::to_string(engine.get_pid()) : "OFFLINE") |
+                   color(hp ? C_GREEN : C_RED) | bold,
+               filler(),
+               text(main_tab == 0   ? "[Addr]"
+                    : main_tab == 1 ? "[Map]"
+                    : main_tab == 2 ? "[CG]"
+                    : main_tab == 3 ? "[Watch]"
+                    : main_tab == 4 ? "[Ptr]"
+                    : main_tab == 5 ? "[Disasm]"
+                                    : "[Struct]") |
+                   color(C_ACCENT2) | bold}) |
+             borderDouble | color(C_ACCENT),
+         hbox({mk_tab(0, "A"), mk_tab(1, "M"), mk_tab(2, "C"), mk_tab(3, "W"),
+               mk_tab(4, "P"), mk_tab(5, "D"), mk_tab(6, "S")}) |
+             hcenter | borderLight});
+
     Elements sb;
-    sb.push_back(hbox(text("◉") | color(hp ? C_GREEN : C_RED),
-                      text(" PID ") | color(C_DIM),
-                      text(hp ? std::to_string(engine.get_pid()) : "---") |
-                          color(hp ? C_GREEN : C_RED) | bold) |
-                 borderLight);
-    sb.push_back(
-        vbox(text(" TABS ") | bold | color(C_ACCENT2) | hcenter,
-             hbox(mk_tab(0, "Addr"), mk_tab(1, "Map"), mk_tab(2, "CG"),
-                  mk_tab(3, "Watch")) |
-                 hcenter,
-             hbox(mk_tab(4, "Ptr"), mk_tab(5, "Disasm"), mk_tab(6, "Struct")) |
-                 hcenter,
-             text(" [Tab] switch ") | color(C_DIM) | hcenter) |
-        borderLight);
     sb.push_back(
         vbox(
             text(" SCAN ") | bold | color(C_ACCENT2) | hcenter,
@@ -723,16 +1030,25 @@ void TUI::run() {
                       text(" F8 Clear Results") | color(C_FG),
                       text(" X  Export JSON") | color(C_GREEN),
                       text(" W  Write Value") | color(C_ORANGE),
-                      text(" G  Go-to Address") | color(C_YELLOW),
+                      text(" G  Go-to Addr") | color(C_YELLOW),
                       text(" B  Build CallGraph") | color(C_GREEN),
                       text(" P  Pointer Scan") | color(C_YELLOW) | bold,
                       text(" A  Add to Watch") | color(C_ACCENT) | bold,
                       text(" E  Ghidra Export") | color(C_ACCENT2),
-                      text(" L  Toggle Alignment") | color(C_DIM),
-                      text(" F10 Speedhack") | color(C_YELLOW) | bold,
+                      text(" N  Auto-Attach") | color(C_ACCENT) | bold,
+                      text(" R  Rec/Stop Rec") |
+                          color(scanner.recording_active ? C_RED : C_DIM),
+                      text(" V  Playback Rec") | color(C_DIM),
+                      text(" Z  Set Breakpoint") | color(C_YELLOW),
+                      separatorLight() | color(C_DIM),
+                      text(" Ctrl+S Save Table") | color(C_YELLOW) | bold,
+                      text(" Ctrl+O Load Table") | color(C_YELLOW) | bold,
+                      text(" Ctrl+P Save PtrMap") | color(C_YELLOW),
+                      separatorLight() | color(C_DIM),
+                      text(" F10 Speedhack") | color(C_YELLOW),
                       text(" F11 Pause/Resume") |
                           color(engine.is_paused() ? C_RED : C_ACCENT),
-                      text(" F12 Kill Process (K)") | color(C_RED) | bold,
+                      text(" F12 Kill Process") | color(C_RED) | bold,
                       text(" F5 Freeze Value") | color(C_CYAN),
                       text(" F3 Hex/Asm Toggle") | color(C_DIM),
                       text(" F4 Attach PID") | color(C_DIM),
@@ -750,7 +1066,6 @@ void TUI::run() {
          << (tracked_address - ri.base_addr);
       bool frz = frozen_addresses.count(tracked_address);
 
-      // Is it a file-backed module?
       bool is_mappable =
           (ri.module_name != "[stack]" && ri.module_name != "[heap]" &&
            ri.module_name != "[anonymous]" && !ri.module_name.empty());
@@ -781,7 +1096,6 @@ void TUI::run() {
         sga << "0x" << std::hex << std::uppercase << ghidra_addr;
         std::string ghidra_str = sga.str();
 
-        // Auto-save to /tmp for easy copy with: cat /tmp/ghidra_addr.txt
         {
           std::ofstream gf("/tmp/ghidra_addr.txt");
           gf << ghidra_str << "\n";
@@ -813,8 +1127,16 @@ void TUI::run() {
     }
     sb.push_back(hbox(text(" F9 ") | bold | color(C_ACCENT),
                       text(" Set Ghidra Base") | dim));
+    if (sidebar_scroll > 0)
+      sb.push_back(text(" ↑ scrolled (wheel to navigate) ") | color(C_DIM) |
+                   dim);
     sb.push_back(filler());
-    return vbox(std::move(sb));
+
+    // Apply sidebar scroll
+    int skip = std::min(sidebar_scroll, std::max(0, (int)sb.size() - 2));
+    Elements sb_visible(sb.begin() + skip, sb.end());
+
+    return vbox(std::move(sb_visible));
   });
 
   // ──────────────────────────────────────────────────────────────────
@@ -822,23 +1144,33 @@ void TUI::run() {
   // ──────────────────────────────────────────────────────────────────
   auto main_layout = Renderer([&]() -> Element {
     bool hp = engine.get_pid() != -1;
-    auto header =
-        hbox(text(" ⬡ IxeRam ") | bold | color(C_ACCENT), filler(),
-             text(hp ? " PID " + std::to_string(engine.get_pid()) + " "
-                     : " OFFLINE ") |
+
+    auto mk_tab_btn = [&](int idx, const std::string &label) {
+      bool sel = (main_tab == idx);
+      return text(" " + label + " ") | (sel ? bold : dim) |
+             color(sel ? Color::White : C_DIM) |
+             (sel ? bgcolor(C_SEL_BG) : bgcolor(Color::Default));
+    };
+
+    auto header = vbox(
+        {hbox({
+             text(" ⬡ IxeRam ") | bold | color(C_ACCENT),
+             filler(),
+             text(hp ? " ◉ " + target_process_name + " (PID " +
+                           std::to_string(engine.get_pid()) + ") "
+                     : " ◉ OFFLINE ") |
                  color(hp ? C_GREEN : C_RED) | bold,
              text(" │ ") | color(C_DIM),
              text(std::to_string(scanner.get_results().size()) + " results") |
                  color(C_ACCENT),
-             text(" │ ") | color(C_DIM),
-             text(main_tab == 0   ? "[Addr]"
-                  : main_tab == 1 ? "[Map]"
-                  : main_tab == 2 ? "[CGraph]"
-                  : main_tab == 3 ? "[Watch]"
-                  : main_tab == 4 ? "[Ptr]"
-                                  : "[Disasm]") |
-                 color(C_YELLOW) | bold) |
-        bgcolor(Color::RGB(15, 15, 25)) | borderLight;
+         }) | bgcolor(Color::RGB(10, 10, 20)) |
+             borderLight,
+         hbox({text(" TABS: ") | bold | color(C_ACCENT2),
+               mk_tab_btn(0, "Addresses"), mk_tab_btn(1, "MemMap"),
+               mk_tab_btn(2, "CallGraph"), mk_tab_btn(3, "Watchlist"),
+               mk_tab_btn(4, "PtrScan"), mk_tab_btn(5, "Disasm"),
+               mk_tab_btn(6, "Struct"), filler(), text("[Tab] cycle ") | dim}) |
+             bgcolor(Color::RGB(15, 15, 25)) | borderLight});
 
     Element center;
     if (main_tab == 0) {
@@ -848,8 +1180,13 @@ void TUI::run() {
                                color(C_DIM)),
                       address_tab->Render()) |
                    flex,
+               window(hbox(text(" ◈ WATCHLIST (Saved) "), filler(),
+                           text(std::to_string(watchlist.size()) + " items") |
+                               color(C_DIM)),
+                      watch_tab->Render()) |
+                   flex,
                window(text(" ◈ LOG "), log_view->Render()) |
-                   size(HEIGHT, EQUAL, 8)) |
+                   size(HEIGHT, EQUAL, 6)) |
           flex;
     } else if (main_tab == 1) {
       center = vbox(window(hbox(text(" ◈ MEMORY MAP "), filler(),
@@ -918,16 +1255,20 @@ void TUI::run() {
     auto footer =
         hbox(text(" F2:Scan") | color(C_GREEN), text("|") | color(C_DIM),
              text("F7:Next") | color(C_ACCENT), text("|") | color(C_DIM),
+             text("F8:Clr") | color(C_RED), text("|") | color(C_DIM),
              text("W:Write") | color(C_ORANGE), text("|") | color(C_DIM),
              text("G:Goto") | color(C_YELLOW), text("|") | color(C_DIM),
-             text("B:CGraph") | color(C_GREEN), text("|") | color(C_DIM),
-             text("E:ExportGhidra") | color(C_ACCENT2),
-             text("|") | color(C_DIM), text("X:ExportJSON") | color(C_GREEN),
-             text("|") | color(C_DIM), text("F5:Freeze") | color(C_CYAN),
+             text("B:CG") | color(C_GREEN), text("|") | color(C_DIM),
+             text("X:JSON") | color(C_GREEN), text("|") | color(C_DIM),
+             text("E:Ghidra") | color(C_ACCENT2), text("|") | color(C_DIM),
+             text("F5:Frz") | color(C_CYAN), text("|") | color(C_DIM),
+             text("N:AttachName") | color(C_ACCENT), text("|") | color(C_DIM),
+             scanner.recording_active ? (text("⏺ REC") | color(C_RED) | blink)
+                                      : (text("R:Rec") | color(C_DIM)),
+             text("|") | color(C_DIM), text("Ctrl+S:Save") | color(C_YELLOW),
              text("|") | color(C_DIM), text("Tab:Tab") | color(C_DIM),
              text("|") | color(C_DIM), text("Q:Quit") | color(C_RED), filler(),
-             text(" IxeRam - made by Internium Entertainment ") |
-                 color(C_DIM)) |
+             text(" IxeRam — Internium Entertainment ") | color(C_DIM)) |
         bgcolor(Color::RGB(12, 12, 22));
 
     return vbox(header,
@@ -1001,15 +1342,17 @@ void TUI::run() {
   });
 
   auto scan_modal_r = Renderer(input_scan, [&] {
-    return vbox(text(" ◈ FIRST SCAN ") | bold | color(C_GREEN) | hcenter,
-                hbox(text(" Type: ") | color(C_DIM),
-                     text(VALUE_TYPE_NAMES[selected_value_type_idx]) |
-                         color(C_ACCENT2) | bold),
-                hbox(text(" Val:  ") | color(C_DIM),
-                     input_scan->Render() | flex),
-                separatorLight(),
-                text(" [T]type  [Enter]scan  [ESC]cancel ") | color(C_DIM) |
-                    hcenter) |
+    return vbox(
+               text(" ◈ FIRST SCAN ") | bold | color(C_GREEN) | hcenter,
+               hbox(text(" Type: ") | color(C_DIM),
+                    text(VALUE_TYPE_NAMES[selected_value_type_idx]) |
+                        color(C_ACCENT2) | bold),
+               hbox(text(" Val:  ") | color(C_DIM),
+                    input_scan->Render() | flex),
+               separatorLight(),
+               text(
+                   " (change type from main menu)  [Enter]scan  [ESC]cancel ") |
+                   color(C_DIM) | hcenter) |
            size(WIDTH, EQUAL, 50) | borderDouble |
            bgcolor(Color::RGB(10, 12, 18)) | center;
   });
@@ -1032,8 +1375,9 @@ void TUI::run() {
     else
       e.push_back(text(" (no value needed) ") | color(C_DIM));
     e.push_back(separatorLight());
-    e.push_back(text(" [Y]mode  [Enter]scan  [ESC]cancel ") | color(C_DIM) |
-                hcenter);
+    e.push_back(
+        text(" (change mode from main menu)  [Enter]scan  [ESC]cancel ") |
+        color(C_DIM) | hcenter);
     return vbox(std::move(e)) | size(WIDTH, EQUAL, 52) | borderDouble |
            bgcolor(Color::RGB(10, 12, 18)) | center;
   });
@@ -1146,6 +1490,7 @@ void TUI::run() {
   });
 
   auto root = Renderer([&] {
+    std::lock_guard<std::recursive_mutex> lock(ui_mutex);
     Element base = main_layout->Render();
     if (show_type_modal)
       base = dbox({base, type_modal_r->Render() | center});
@@ -1186,6 +1531,76 @@ void TUI::run() {
           borderRounded | color(C_FG) | size(WIDTH, GREATER_THAN, 40);
       base = dbox({base, modal | center});
     }
+    // Auto-attach modal (#10)
+    if (show_autoattach_modal) {
+      auto modal =
+          vbox(text(" ◈ AUTO-ATTACH BY NAME ") | bold | color(C_ACCENT) |
+                   hcenter,
+               separatorLight(),
+               text(" Enter process name to wait for:") | color(C_DIM),
+               hbox(text(" Name: ") | color(C_DIM),
+                    input_autoattach->Render() | flex),
+               separatorLight(),
+               text(" Waits up to 15 sec for process to appear ") |
+                   color(C_DIM) | hcenter,
+               text(" [Enter]start [ESC]cancel ") | color(C_DIM) | hcenter) |
+          size(WIDTH, EQUAL, 50) | borderDouble |
+          bgcolor(Color::RGB(10, 10, 22)) | center;
+      base = dbox({base, modal});
+    }
+    // Cheat Table save modal (#2)
+    if (show_save_ct_modal) {
+      auto modal =
+          vbox(text(" ◈ SAVE CHEAT TABLE ") | bold | color(C_YELLOW) | hcenter,
+               separatorLight(),
+               hbox(text(" Path: ") | color(C_DIM),
+                    input_ct_path->Render() | flex),
+               separatorLight(),
+               text(" Saves watchlist, frozen addrs, pointer map ") |
+                   color(C_DIM) | hcenter,
+               text(" [Enter]save [ESC]cancel ") | color(C_DIM) | hcenter) |
+          size(WIDTH, EQUAL, 50) | borderDouble |
+          bgcolor(Color::RGB(20, 20, 5)) | center;
+      base = dbox({base, modal});
+    }
+    // Cheat Table load modal (#2)
+    if (show_load_ct_modal) {
+      auto modal =
+          vbox(text(" ◈ LOAD CHEAT TABLE ") | bold | color(C_YELLOW) | hcenter,
+               separatorLight(),
+               hbox(text(" Path: ") | color(C_DIM),
+                    input_ct_path->Render() | flex),
+               separatorLight(),
+               text(" Loads watchlist, frozen addrs, pointer map ") |
+                   color(C_DIM) | hcenter,
+               text(" [Enter]load [ESC]cancel ") | color(C_DIM) | hcenter) |
+          size(WIDTH, EQUAL, 50) | borderDouble |
+          bgcolor(Color::RGB(20, 20, 5)) | center;
+      base = dbox({base, modal});
+    }
+    // Record modal (#8)
+    if (show_record_modal) {
+      size_t nsamp = scanner.value_recording.size();
+      auto modal =
+          vbox(text(" ◈ RECORD / PLAYBACK ") | bold | color(C_RED) | hcenter,
+               separatorLight(),
+               hbox(text(" Addr: ") | color(C_DIM),
+                    text(hex_str(tracked_address)) | color(C_CYAN) | bold),
+               hbox(text(" Samples: ") | color(C_DIM),
+                    text(std::to_string(nsamp)) | color(C_GREEN) | bold),
+               hbox(text(" Status: ") | color(C_DIM),
+                    scanner.recording_active
+                        ? (text("⏺ RECORDING") | color(C_RED) | blink)
+                    : record_playing ? (text("▶ PLAYING") | color(C_GREEN))
+                                     : (text("⏹ IDLE") | color(C_DIM))),
+               separatorLight(),
+               text(" [R] Start/Stop Record  [V] Start Playback ") |
+                   color(C_DIM) | hcenter,
+               text(" [ESC] Close ") | color(C_DIM) | hcenter) |
+          size(WIDTH, EQUAL, 48) | borderDouble |
+          bgcolor(Color::RGB(22, 8, 8)) | center;
+      base = dbox({base, modal});
+    }
     return base;
   });
 
@@ -1193,6 +1608,74 @@ void TUI::run() {
   // EVENT HANDLER
   // ──────────────────────────────────────────────────────────────────
   auto component = CatchEvent(root, [&](Event ev) -> bool {
+    std::lock_guard<std::recursive_mutex> lock(ui_mutex);
+    // ── Mouse events ──────────────────────────────────────────────────
+    if (ev.is_mouse()) {
+      auto &m = ev.mouse();
+      bool is_wheel_up = (m.button == Mouse::WheelUp);
+      bool is_wheel_down = (m.button == Mouse::WheelDown);
+      if (!is_wheel_up && !is_wheel_down)
+        return false; // only handle wheel here; clicks handled by FTXUI
+                      // components
+
+      int sidebar_width = 32;
+      int right_panel_w = term_cols() / 4; // approx
+      // Determine which panel the mouse is over by X coordinate
+      bool over_sidebar = (m.x < sidebar_width);
+      // Right panel: roughly last ~right_panel_w columns (after center)
+      // Log panel: bottom ~10 rows (y > term_rows() - 11)
+      bool over_log = (m.y > term_rows() - 11);
+      bool over_right =
+          (!over_sidebar && !over_log && m.x > term_cols() - right_panel_w - 2);
+      bool over_center = (!over_sidebar && !over_log && !over_right);
+
+      if (over_sidebar) {
+        // Sidebar scroll
+        if (is_wheel_up)
+          sidebar_scroll = std::max(0, sidebar_scroll - 1);
+        if (is_wheel_down)
+          sidebar_scroll++;
+        return true;
+      }
+      if (over_log) {
+        // Log scroll (0=bottom, positive=up)
+        if (is_wheel_up)
+          log_scroll = std::min(log_scroll + 3, (int)logs.size());
+        if (is_wheel_down)
+          log_scroll = std::max(0, log_scroll - 3);
+        return true;
+      }
+      if (over_center || over_right) {
+        int delta = is_wheel_up ? -1 : 1;
+        if (main_tab == 0) {
+          selected_result_idx =
+              std::max(0, std::min((int)categorized_results.size() - 1,
+                                   selected_result_idx + delta));
+        } else if (main_tab == 1) {
+          selected_map_idx = std::max(0, std::min((int)map_entries.size() - 1,
+                                                  selected_map_idx + delta));
+        } else if (main_tab == 2) {
+          selected_cg_idx = std::max(
+              0, std::min((int)call_graph.size() - 1, selected_cg_idx + delta));
+        } else if (main_tab == 3) {
+          selected_watch_idx =
+              std::max(0, std::min((int)watchlist.size() - 1,
+                                   selected_watch_idx + delta));
+        } else if (main_tab == 4) {
+          selected_ptr_idx = std::max(0, std::min((int)ptr_results.size() - 1,
+                                                  selected_ptr_idx + delta));
+        } else if (main_tab == 5) {
+          selected_disasm_idx =
+              std::max(0, std::min((int)disasm_lines.size() - 1,
+                                   selected_disasm_idx + delta));
+        } else if (main_tab == 6) {
+          center_scroll = std::max(0, center_scroll + delta);
+        }
+        return true;
+      }
+      return false;
+    }
+    // ─────────────────────────────────────────────────────────────────
     if (show_type_modal) {
       if (ev == Event::Escape) {
         show_type_modal = false;
@@ -1265,10 +1748,6 @@ void TUI::run() {
         show_scan_modal = false;
         return true;
       }
-      if (ev == Event::Character('t') || ev == Event::Character('T')) {
-        show_type_modal = true;
-        return true;
-      }
       return input_scan->OnEvent(ev);
     }
     if (show_next_scan_modal) {
@@ -1278,10 +1757,6 @@ void TUI::run() {
       }
       if (ev == Event::Escape) {
         show_next_scan_modal = false;
-        return true;
-      }
-      if (ev == Event::Character('y') || ev == Event::Character('Y')) {
-        show_scan_type_modal = true;
         return true;
       }
       return input_next->OnEvent(ev);
@@ -1411,9 +1886,8 @@ void TUI::run() {
                 "/dev/shm/speedhack_" + std::to_string(engine.get_pid());
             chmod(shm_full_path.c_str(), 0666);
             add_log("✓ Speedhack set to " + speedhack_input + "x");
-            add_log("  (Run app: "
-                    "LD_PRELOAD=/home/myster_gaif/Documents/C_C++/"
-                    "low-lewel_game_engine/build/libspeedhack.so ./app)");
+            add_log(
+                "  (Run app with: LD_PRELOAD=./build/libspeedhack.so ./app)");
           } else {
             add_log("✗ Speedhack error: SHM open failed");
           }
@@ -1457,6 +1931,56 @@ void TUI::run() {
       return true;
     }
 
+    if (show_autoattach_modal) {
+      if (ev == Event::Return) {
+        do_autoattach();
+        return true;
+      }
+      if (ev == Event::Escape) {
+        show_autoattach_modal = false;
+        return true;
+      }
+      return input_autoattach->OnEvent(ev);
+    }
+    if (show_save_ct_modal) {
+      if (ev == Event::Return) {
+        save_cheat_table(ct_path_input);
+        show_save_ct_modal = false;
+        return true;
+      }
+      if (ev == Event::Escape) {
+        show_save_ct_modal = false;
+        return true;
+      }
+      return input_ct_path->OnEvent(ev);
+    }
+    if (show_load_ct_modal) {
+      if (ev == Event::Return) {
+        load_cheat_table(ct_path_input);
+        show_load_ct_modal = false;
+        return true;
+      }
+      if (ev == Event::Escape) {
+        show_load_ct_modal = false;
+        return true;
+      }
+      return input_ct_path->OnEvent(ev);
+    }
+    if (show_record_modal) {
+      if (ev == Event::Character('r') || ev == Event::Character('R')) {
+        do_record_toggle();
+        return true;
+      }
+      if (ev == Event::Character('v') || ev == Event::Character('V')) {
+        do_start_playback();
+        return true;
+      }
+      if (ev == Event::Escape) {
+        show_record_modal = false;
+        return true;
+      }
+      return true;
+    }
     if (ev == Event::Character('q') || ev == Event::Character('Q')) {
       engine.detach();
       screen.ExitLoopClosure()();
@@ -1631,6 +2155,49 @@ void TUI::run() {
       return true;
     }
 
+    if (ev == Event::Character('n') || ev == Event::Character('N')) {
+      autoattach_name_input.clear();
+      show_autoattach_modal = true;
+      return true;
+    }
+    if (ev == Event::Character('r') || ev == Event::Character('R')) {
+      do_record_toggle();
+      return true;
+    }
+    if (ev == Event::Character('v') || ev == Event::Character('V')) {
+      if (!record_playing)
+        do_start_playback();
+      else {
+        record_playing = false;
+        add_log("⏹ Playback stopped");
+      }
+      return true;
+    }
+    // Ctrl+S: Save cheat table
+    if (ev == Event::Special({19})) { // Ctrl+S = ASCII 19
+      show_save_ct_modal = true;
+      return true;
+    }
+    // Ctrl+O: Load cheat table
+    if (ev == Event::Special({15})) { // Ctrl+O = ASCII 15
+      show_load_ct_modal = true;
+      return true;
+    }
+    // Ctrl+P: Save pointer map
+    if (ev == Event::Special({16})) { // Ctrl+P = ASCII 16
+      std::string ppath =
+          "pointers_" + std::to_string(engine.get_pid()) + ".ptr";
+      if (scanner.save_ptr_results(ppath))
+        add_log("✓ Pointer map saved → " + ppath);
+      else
+        add_log("✗ Failed to save pointer map");
+      return true;
+    }
+    // Ctrl+B: Wait for breakpoint (non-blocking)
+    if (ev == Event::Special({2})) { // Ctrl+B = ASCII 2
+      do_wait_bp();
+      return true;
+    }
     // Disassembler specific keys
     if (main_tab == 5 && !disasm_lines.empty()) {
       if (ev == Event::Character(' ')) {
@@ -1662,6 +2229,17 @@ void TUI::run() {
         }
         return true;
       }
+      // #7: Set breakpoint
+      if (ev == Event::Character('z') || ev == Event::Character('Z')) {
+        do_set_bp();
+        return true;
+      }
+      // Toggle access log tab
+      if (ev == Event::Character('u') || ev == Event::Character('U')) {
+        show_access_tab = !show_access_tab;
+        add_log(show_access_tab ? "→ Access Log" : "→ Disasm");
+        return true;
+      }
     }
 
     if (ev == Event::ArrowDown) {
@@ -1683,6 +2261,10 @@ void TUI::run() {
       } else if (main_tab == 5) {
         if (selected_disasm_idx < (int)disasm_lines.size() - 1)
           selected_disasm_idx++;
+        else if (selected_disasm_idx > 0 && tracked_address > 0 &&
+                 !disasm_lines.empty()) {
+          tracked_address += disasm_lines[0].size;
+        }
       }
       return true;
     }
@@ -1706,7 +2288,10 @@ void TUI::run() {
         if (selected_disasm_idx > 0)
           selected_disasm_idx--;
         else if (selected_disasm_idx == 0 && tracked_address > 0) {
-          tracked_address -= 1; // Slide window slightly back
+          // Slide window back by a heuristic amount or by checking previous
+          // instructions Subtracting 4 is a safe compromise for x64 to find
+          // *some* valid boundary
+          tracked_address = (tracked_address > 8) ? tracked_address - 8 : 0;
         }
       }
       return true;
@@ -1721,6 +2306,17 @@ void TUI::run() {
       update_tracking_data();
       if (main_tab == 1)
         update_memory_map();
+
+      // #8: Sample value for recording
+      if (scanner.recording_active && tracked_address) {
+        double cur = read_as_double(tracked_address);
+        scanner.value_recording.push_back(
+            {std::chrono::steady_clock::now(), cur});
+        // Limit to 10 minutes at 150ms = 4000 samples
+        if (scanner.value_recording.size() > 4000)
+          scanner.value_recording.erase(scanner.value_recording.begin());
+      }
+
       screen.PostEvent(Event::Custom);
       std::this_thread::sleep_for(std::chrono::milliseconds(150));
     }

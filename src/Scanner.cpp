@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <mutex>
@@ -13,13 +14,15 @@
 Scanner::Scanner(MemoryEngine &engine)
     : engine(engine), current_value_type(ValueType::Int32), first_scan(true) {}
 
-// ─── Parse string → raw bytes for current type ───────────────────────────────
-std::vector<uint8_t> Scanner::parse_value(const std::string &value_str) const {
-  size_t sz = valueTypeSize(current_value_type);
+// ─── Parse string → raw bytes for specified type
+// ───────────────────────────────
+std::vector<uint8_t> Scanner::parse_value(const std::string &value_str,
+                                          ValueType target_type) const {
+  size_t sz = valueTypeSize(target_type);
   std::vector<uint8_t> bytes(sz, 0);
 
   try {
-    switch (current_value_type) {
+    switch (target_type) {
     case ValueType::Int8: {
       int8_t v = (int8_t)std::stoi(value_str);
       std::memcpy(bytes.data(), &v, sz);
@@ -206,8 +209,9 @@ std::string Scanner::read_value_str(uintptr_t address) const {
 
 // ─── Write value to address
 // ───────────────────────────────────────────────────
-bool Scanner::write_value(uintptr_t address, const std::string &value_str) {
-  auto bytes = parse_value(value_str);
+bool Scanner::write_value(uintptr_t address, const std::string &value_str,
+                          ValueType type) {
+  auto bytes = parse_value(value_str, type);
   if (bytes.empty())
     return false;
   return engine.write_memory(address, bytes.data(), bytes.size());
@@ -317,12 +321,13 @@ template <typename T> void Scanner::initial_scan_typed(T target) {
 
 void Scanner::initial_scan(ValueType type, const std::string &value_str) {
   current_value_type = type;
+  current_value_type = type;
   first_scan = false;
   if (type == ValueType::AOB) {
     aob_scan(value_str);
     return;
   }
-  auto target_bytes = parse_value(value_str);
+  auto target_bytes = parse_value(value_str, current_value_type);
 
   switch (type) {
   case ValueType::Int8: {
@@ -477,6 +482,11 @@ void Scanner::next_scan_typed(ScanType scan_type, T target, bool use_target) {
           case ScanType::SmallerThan:
             match = (current_val < target);
             break;
+          case ScanType::Between:
+            // target holds min; target2 is passed externally (handled in
+            // next_scan_between dispatch, so we reuse target as a flag here)
+            match = true; // will be filtered outside
+            break;
           case ScanType::Increased:
             match = (current_val > prev_val);
             break;
@@ -541,7 +551,27 @@ void Scanner::next_scan_typed(ScanType scan_type, T target, bool use_target) {
 }
 
 void Scanner::next_scan(ScanType scan_type, const std::string &value_str) {
-  auto target_bytes = parse_value(value_str);
+  // Special case: Between needs two values "min,max"
+  if (scan_type == ScanType::Between) {
+    // Parse "min,max" or "min max"
+    std::string s = value_str;
+    for (auto &c : s)
+      if (c == ',')
+        c = ' ';
+    std::istringstream iss2(s);
+    std::string smin, smax;
+    iss2 >> smin >> smax;
+    if (smin.empty() || smax.empty())
+      return;
+    // Run as BiggerThan(min) then filter with SmallerThan(max)
+    // Use a direct approach: scan with Changed (captures all), then filter
+    // We run BiggerThan(min) pass, store, then do SmallerThan(max) on that
+    next_scan(ScanType::BiggerThan, smin);
+    next_scan(ScanType::SmallerThan, smax);
+    return;
+  }
+
+  auto target_bytes = parse_value(value_str, current_value_type);
   bool use_target = !value_str.empty();
 
   switch (current_value_type) {
@@ -832,8 +862,155 @@ Scanner::find_pointers(uintptr_t target_addr, int max_depth, int max_offset) {
     }
     if (found.size() > 100)
       break; // Limit results
-    // current_level = next_level; // For full recursion, but too slow for now
+
+    if (next_level.size() > 2000)
+      next_level.resize(
+          2000); // Prevent exponential explosion but still scan deeply
+    current_level = std::move(next_level);
   }
 
   return found;
+}
+
+// Store a copy in the cache for save/load
+// (We update find_pointers_cache at the call site in TUI, not here,
+//  since find_pointers is const-ish and takes target_addr)
+// Actually update cache here:
+void Scanner_update_ptr_cache(Scanner *s,
+                              std::vector<Scanner::PointerPath> &v) {
+  s->find_pointers_cache = v;
+}
+
+// ─── Unknown Initial Value Scan
+// ──────────────────────────────────────────────────────
+void Scanner::unknown_initial_scan(ValueType type) {
+  current_value_type = type;
+  first_scan = false;
+  scanning_active = true;
+  progress = 0;
+  results.clear();
+
+  size_t item_size = valueTypeSize(type);
+  if (item_size == 0)
+    item_size = 4;
+
+  auto regions = engine.update_maps();
+  std::vector<MemoryRegion> filtered;
+  uint64_t total_size = 0;
+
+  for (const auto &r : regions) {
+    if (!r.is_readable() || !r.is_writable())
+      continue;
+    if (r.pathname == "[vsyscall]")
+      continue;
+    if ((r.end - r.start) > 1024 * 1024 * 1024ULL)
+      continue;
+    filtered.push_back(r);
+    total_size += (r.end - r.start);
+  }
+
+  std::mutex mtx;
+  unsigned num_threads = std::thread::hardware_concurrency();
+  if (num_threads == 0)
+    num_threads = 4;
+  std::vector<std::future<void>> futures;
+  std::atomic<uint64_t> bytes_processed{0};
+
+  for (unsigned t = 0; t < num_threads; ++t) {
+    futures.push_back(std::async(std::launch::async, [&, t, num_threads]() {
+      const size_t CHUNK = 1024 * 1024;
+      std::vector<uint8_t> buf(CHUNK);
+      std::vector<ScanResult> local;
+
+      for (size_t r_idx = t; r_idx < filtered.size(); r_idx += num_threads) {
+        const auto &reg = filtered[r_idx];
+        for (uintptr_t addr = reg.start; addr < reg.end; addr += CHUNK) {
+          size_t to_read = std::min(CHUNK, (size_t)(reg.end - addr));
+          if (to_read < item_size) {
+            bytes_processed += to_read;
+            continue;
+          }
+          if (engine.read_memory(addr, buf.data(), to_read)) {
+            size_t step = aligned_scan ? std::max((size_t)1, item_size) : 1;
+            for (size_t i = 0; i + item_size <= to_read; i += step) {
+              ScanResult sr;
+              sr.address = addr + i;
+              std::memset(sr.prev_value, 0, 8);
+              std::memcpy(sr.prev_value, &buf[i],
+                          std::min(item_size, (size_t)8));
+              local.push_back(sr);
+            }
+          }
+          bytes_processed += to_read;
+          progress = (float)bytes_processed.load() / total_size;
+        }
+      }
+      if (!local.empty()) {
+        std::lock_guard<std::mutex> lk(mtx);
+        results.insert(results.end(), local.begin(), local.end());
+      }
+    }));
+  }
+  for (auto &f : futures)
+    f.wait();
+
+  std::sort(results.begin(), results.end(),
+            [](const ScanResult &a, const ScanResult &b) {
+              return a.address < b.address;
+            });
+  progress = 1.0f;
+  scanning_active = false;
+}
+
+// ─── Save / Load Pointer Results
+// ────────────────────────────────────────────────────
+bool Scanner::save_ptr_results(const std::string &path) const {
+  std::ofstream f(path);
+  if (!f)
+    return false;
+  f << "# IxeRam Pointer Map\n";
+  for (const auto &p : find_pointers_cache) {
+    f << p.module_name << "," << std::hex << p.base_module_addr;
+    for (auto o : p.offsets)
+      f << "," << std::dec << o;
+    f << "\n";
+  }
+  return true;
+}
+
+bool Scanner::load_ptr_results(const std::string &path) {
+  std::ifstream f(path);
+  if (!f)
+    return false;
+  find_pointers_cache.clear();
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty() || line[0] == '#')
+      continue;
+    std::istringstream iss(line);
+    std::string tok;
+    PointerPath pp;
+    bool first = true;
+    bool second = true;
+    while (std::getline(iss, tok, ',')) {
+      if (first) {
+        pp.module_name = tok;
+        first = false;
+      } else if (second) {
+        try {
+          pp.base_module_addr = std::stoull(tok, nullptr, 16);
+        } catch (...) {
+        }
+        second = false;
+      } else {
+        try {
+          pp.offsets.push_back(std::stoll(tok));
+        } catch (...) {
+        }
+      }
+    }
+    if (!pp.module_name.empty())
+      find_pointers_cache.push_back(pp);
+  }
+  return true;
 }

@@ -27,6 +27,7 @@ bool MemoryEngine::attach(pid_t pid) {
 }
 
 void MemoryEngine::detach() {
+  clear_breakpoints();
   target_pid = -1;
   regions.clear();
 }
@@ -170,9 +171,168 @@ bool MemoryEngine::kill_process() {
   if (target_pid <= 0)
     return false;
   if (kill(target_pid, SIGKILL) == 0) {
-    target_pid = 0;
+    target_pid = -1;
     process_paused = false;
     return true;
   }
   return false;
+}
+
+// ─── Auto-attach by process name ─────────────────────────────────────────────
+#include <chrono>
+#include <dirent.h>
+#include <thread>
+
+pid_t MemoryEngine::find_pid_by_name(const std::string &name) {
+  DIR *dir = opendir("/proc");
+  if (!dir)
+    return -1;
+
+  struct dirent *ent;
+  while ((ent = readdir(dir)) != nullptr) {
+    if (ent->d_type != DT_DIR)
+      continue;
+    bool is_pid = true;
+    for (char c : std::string(ent->d_name))
+      if (!isdigit(c)) {
+        is_pid = false;
+        break;
+      }
+    if (!is_pid)
+      continue;
+
+    std::string comm_path = "/proc/" + std::string(ent->d_name) + "/comm";
+    std::ifstream comm_file(comm_path);
+    if (!comm_file)
+      continue;
+
+    std::string comm;
+    std::getline(comm_file, comm);
+    if (comm == name || name.find(comm) != std::string::npos ||
+        comm.find(name) != std::string::npos) {
+      pid_t pid = std::stoi(ent->d_name);
+      closedir(dir);
+      return pid;
+    }
+  }
+  closedir(dir);
+  return -1;
+}
+
+pid_t MemoryEngine::wait_for_process(const std::string &name, int max_ms) {
+  auto start = std::chrono::steady_clock::now();
+  while (true) {
+    pid_t pid = find_pid_by_name(name);
+    if (pid != -1)
+      return pid;
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start)
+            .count() >= max_ms)
+      return -1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+}
+
+// ─── Software Breakpoints via ptrace ─────────────────────────────────────────
+#include <cerrno>
+#include <sys/ptrace.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+
+bool MemoryEngine::set_breakpoint(uintptr_t address) {
+  if (target_pid <= 0)
+    return false;
+  if (breakpoints.count(address))
+    return true;
+
+  errno = 0;
+  long orig = ptrace(PTRACE_PEEKTEXT, target_pid, (void *)address, nullptr);
+  if (errno != 0)
+    return false;
+
+  uint8_t orig_byte = (uint8_t)(orig & 0xFF);
+  breakpoints[address] = orig_byte;
+
+  long patched = (orig & ~0xFFL) | 0xCC;
+  if (ptrace(PTRACE_POKETEXT, target_pid, (void *)address, (void *)patched) !=
+      0)
+    return false;
+
+  return true;
+}
+
+bool MemoryEngine::remove_breakpoint(uintptr_t address) {
+  if (target_pid <= 0)
+    return false;
+  auto it = breakpoints.find(address);
+  if (it == breakpoints.end())
+    return false;
+
+  errno = 0;
+  long current = ptrace(PTRACE_PEEKTEXT, target_pid, (void *)address, nullptr);
+  if (errno != 0)
+    return false;
+
+  long restored = (current & ~0xFFL) | it->second;
+  if (ptrace(PTRACE_POKETEXT, target_pid, (void *)address, (void *)restored) !=
+      0)
+    return false;
+
+  breakpoints.erase(it);
+  return true;
+}
+
+bool MemoryEngine::wait_breakpoint(uintptr_t &hit_addr, int timeout_ms) {
+  if (target_pid <= 0 || breakpoints.empty())
+    return false;
+
+  if (ptrace(PTRACE_CONT, target_pid, nullptr, nullptr) != 0)
+    return false;
+
+  auto start = std::chrono::steady_clock::now();
+  while (true) {
+    int wstatus = 0;
+    pid_t wpid = waitpid(target_pid, &wstatus, WNOHANG);
+    if (wpid == target_pid) {
+      if (WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == SIGTRAP) {
+        struct user_regs_struct regs;
+        if (ptrace(PTRACE_GETREGS, target_pid, nullptr, &regs) == 0) {
+          hit_addr = (uintptr_t)(regs.rip - 1);
+          AccessRecord ar;
+          ar.rip = regs.rip - 1;
+          ar.rax = regs.rax;
+          ar.rbx = regs.rbx;
+          ar.rcx = regs.rcx;
+          ar.rdx = regs.rdx;
+          ar.is_write = false;
+          access_records.push_back(ar);
+          regs.rip = regs.rip - 1;
+          ptrace(PTRACE_SETREGS, target_pid, nullptr, &regs);
+          remove_breakpoint(hit_addr);
+          process_paused = true;
+          return true;
+        }
+      }
+      return false;
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start)
+            .count() >= timeout_ms)
+      return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+}
+
+void MemoryEngine::clear_breakpoints() {
+  if (target_pid > 0) {
+    for (auto &[addr, orig] : breakpoints) {
+      errno = 0;
+      long current = ptrace(PTRACE_PEEKTEXT, target_pid, (void *)addr, nullptr);
+      if (errno == 0) {
+        long restored = (current & ~0xFFL) | orig;
+        ptrace(PTRACE_POKETEXT, target_pid, (void *)addr, (void *)restored);
+      }
+    }
+  }
+  breakpoints.clear();
 }

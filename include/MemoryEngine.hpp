@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <sys/types.h>
 #include <vector>
@@ -18,6 +19,12 @@ struct MemoryRegion {
   bool is_readable() const {
     return permissions.find('r') != std::string::npos;
   }
+};
+
+struct AccessRecord {
+  uint64_t rip;                // instruction address that caused access
+  uint64_t rax, rbx, rcx, rdx; // register context
+  bool is_write;
 };
 
 class MemoryEngine {
@@ -41,8 +48,29 @@ public:
   bool kill_process();
   bool is_paused() const { return process_paused; }
 
+  // ─── Auto-attach by process name ──────────────────────────────────
+  // Returns PID of first matching process, or -1 if not found
+  static pid_t find_pid_by_name(const std::string &name);
+  // Watch for process by name to appear, returns pid when found (blocking,
+  // max_ms timeout)
+  static pid_t wait_for_process(const std::string &name, int max_ms = 10000);
+
+  // ─── Software Breakpoints (int3) via ptrace ────────────────────────
+  // Set int3 breakpoint at address (saves original byte)
+  bool set_breakpoint(uintptr_t address);
+  // Remove breakpoint (restore original byte)
+  bool remove_breakpoint(uintptr_t address);
+  // Wait for any breakpoint to hit (blocking), populates last_access
+  bool wait_breakpoint(uintptr_t &hit_addr, int timeout_ms = 5000);
+  // Get last access records (filled by breakpoint hit)
+  std::vector<AccessRecord> access_records;
+  // Clear all breakpoints
+  void clear_breakpoints();
+
 private:
   pid_t target_pid;
   bool process_paused = false;
   std::vector<MemoryRegion> regions;
+  // breakpoint addr -> original byte
+  std::map<uintptr_t, uint8_t> breakpoints;
 };
